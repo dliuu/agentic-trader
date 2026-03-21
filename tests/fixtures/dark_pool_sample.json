@@ -1,0 +1,9 @@
+{
+  "data": [
+    {
+      "ticker_symbol": "ACME",
+      "cost": 750000,
+      "execution_time": "2026-03-20T14:25:00Z"
+    }
+  ]
+}

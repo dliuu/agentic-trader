@@ -1,0 +1,86 @@
+# Unusual Whales API
+api:
+  base_url: "https://api.unusualwhales.com"
+  client_id: "100001"
+  # API token loaded from .env, not stored here
+
+# Polling cadence
+polling:
+  flow_alerts_interval_seconds: 30
+  dark_pool_interval_seconds: 120
+  market_tide_interval_seconds: 120
+  market_open: "09:30"       # ET
+  market_close: "16:00"      # ET
+  pre_market_start: "09:15"  # Start polling slightly early
+  timezone: "US/Eastern"
+
+# Filter thresholds — Agent A's rule definitions
+filters:
+  # Out-of-the-money filter
+  otm:
+    enabled: true
+    min_otm_percentage: 5     # Strike at least 5% from spot
+    max_otm_percentage: 50    # Ignore >50% OTM (likely data errors)
+
+  # Premium size
+  premium:
+    enabled: true
+    min_premium_usd: 25000    # At least $25k total premium
+    min_premium_vs_avg_ratio: 3.0  # 3x the 20-day avg premium
+
+  # Volume and open interest
+  volume:
+    enabled: true
+    size_greater_oi: true     # Trade size exceeds open interest
+    min_volume_oi_ratio: 2.0  # Volume at least 2x OI
+    max_avg_daily_volume: 500 # Flag low-volume tickers (contracts/day)
+
+  # Time to expiration
+  expiry:
+    enabled: true
+    max_dte: 14               # Near-term bets only (days to expiry)
+    min_dte: 1                # Skip 0DTE noise
+
+  # Execution type
+  execution:
+    enabled: true
+    require_sweep_or_block: true  # Sweep = urgency, block = size
+
+  # Dark pool confluence
+  dark_pool:
+    enabled: true
+    min_notional_usd: 500000  # Dark pool print size threshold
+    lookback_minutes: 30      # Match with options flow within window
+
+  # Market regime filter
+  market_regime:
+    enabled: true
+    respect_tide_direction: true
+    tide_threshold_ratio: 1.5
+
+# Confluence scoring — how many signals needed
+confluence:
+  min_signals_required: 2     # Must match at least 2 rules
+  weights:
+    otm: 1.0
+    premium: 1.5
+    volume: 1.0
+    expiry: 0.5
+    execution: 1.0
+    dark_pool: 2.0
+    market_regime: 0.5
+
+# Deduplication
+dedup:
+  ttl_minutes: 60             # Forget seen trades after 1 hour
+  key_fields:
+    - ticker
+    - strike
+    - expiry
+    - direction
+
+# Output
+output:
+  queue_max_size: 100
+  sqlite_db_path: "data/scanner.db"
+  slack_webhook_url: null     # Set in .env if desired
