@@ -1,8 +1,11 @@
 {
   "data": [
     {
-      "net_premium": 2.5,
-      "tide_threshold_ratio": 1.5
+      "timestamp": "2026-03-20T09:30:00-04:00",
+      "date": "2026-03-20",
+      "net_call_premium": "-26877161.0000",
+      "net_put_premium": "2143580.0000",
+      "net_volume": -73980
     }
   ]
 }

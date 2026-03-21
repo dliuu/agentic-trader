@@ -1,5 +1,26 @@
 """Shared pytest fixtures."""
+import json
+from pathlib import Path
+
 import pytest
+
+
+@pytest.fixture
+def flow_fixture():
+    fixture_path = Path(__file__).parent / "fixtures" / "flow_alerts_sample.json"
+    return json.loads(fixture_path.read_text())
+
+
+@pytest.fixture
+def dark_pool_fixture():
+    fixture_path = Path(__file__).parent / "fixtures" / "dark_pool_sample.json"
+    return json.loads(fixture_path.read_text())
+
+
+@pytest.fixture
+def market_tide_fixture():
+    fixture_path = Path(__file__).parent / "fixtures" / "market_tide_sample.json"
+    return json.loads(fixture_path.read_text())
 
 
 @pytest.fixture

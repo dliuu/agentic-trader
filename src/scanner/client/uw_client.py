@@ -85,18 +85,8 @@ class UWClient:
         result = []
         for item in data:
             try:
-                # Normalize common API field variations
-                row = {}
-                for k, v in item.items():
-                    if k in ("ticker_symbol", "ticker"):
-                        row["ticker_symbol"] = v
-                    elif k in ("cost", "notional"):
-                        row["cost"] = v
-                    elif k in ("execution_time", "executed_at", "timestamp"):
-                        row["execution_time"] = v
-                    else:
-                        row[k] = v
-                result.append(DarkPoolPrint.model_validate(row))
+                # Model accepts ticker, premium, executed_at (and aliases) directly
+                result.append(DarkPoolPrint.model_validate(item))
             except Exception as e:
                 logger.warning("dark_pool_parse_error", item=item, error=str(e))
         return result

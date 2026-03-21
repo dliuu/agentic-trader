@@ -1,9 +1,11 @@
 {
   "data": [
     {
-      "ticker_symbol": "ACME",
-      "cost": 750000,
-      "execution_time": "2026-03-20T14:25:00Z"
+      "ticker": "ACME",
+      "premium": "750000.00",
+      "executed_at": "2026-03-20T14:25:00Z",
+      "size": 1000,
+      "price": "750.00"
     }
   ]
 }

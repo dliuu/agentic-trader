@@ -9,7 +9,7 @@ def multi_signal_alert():
     """Alert that triggers OTM + premium + execution filters."""
     return FlowAlert(
         id="eng-1",
-        ticker_symbol="MULTI",
+        ticker="MULTI",
         type="Calls",
         strike=200.0,
         expiry="2026-04-03",
@@ -34,12 +34,13 @@ def test_engine_flags_candidate(sample_config, multi_signal_alert):
 
 def test_engine_rejects_below_confluence(sample_config):
     """Single-signal alert should not pass min_signals_required=2."""
+    # OTM passes (5.3%), but expiry fails (20 DTE > max 14), execution fails (Split)
     alert = FlowAlert(
         id="eng-2",
-        ticker_symbol="WEAK",
+        ticker="WEAK",
         type="Calls",
         strike=100.0,
-        expiry="2026-04-03",
+        expiry="2026-04-18",  # 28 DTE, outside 1-14
         total_premium=10000.0,
         total_size=50,
         open_interest=100,

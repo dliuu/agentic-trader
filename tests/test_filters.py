@@ -8,7 +8,7 @@ from scanner.rules.filters import check_otm, check_premium, check_volume_oi
 def deep_otm_alert():
     return FlowAlert(
         id="test-1",
-        ticker_symbol="ACME",
+        ticker="ACME",
         type="Calls",
         strike=180.0,
         expiry="2026-04-03",
@@ -33,7 +33,7 @@ def test_otm_filter_triggers(deep_otm_alert):
 def test_otm_filter_skips_near_money():
     alert = FlowAlert(
         id="test-2",
-        ticker_symbol="XYZ",
+        ticker="XYZ",
         type="Calls",
         strike=142.0,
         expiry="2026-04-03",
@@ -53,7 +53,7 @@ def test_otm_filter_skips_near_money():
 def test_premium_filter():
     alert = FlowAlert(
         id="test-3",
-        ticker_symbol="BIG",
+        ticker="BIG",
         type="Puts",
         strike=100.0,
         expiry="2026-04-03",
@@ -73,7 +73,7 @@ def test_premium_filter():
 def test_volume_oi_ratio():
     alert = FlowAlert(
         id="test-4",
-        ticker_symbol="TINY",
+        ticker="TINY",
         type="Calls",
         strike=50.0,
         expiry="2026-04-03",
