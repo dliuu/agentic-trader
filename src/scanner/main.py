@@ -10,6 +10,7 @@ The main loop:
 7. Sleep until next cycle
 8. Repeat
 """
+import argparse
 import asyncio
 import os
 from datetime import datetime
@@ -22,17 +23,17 @@ from dotenv import load_dotenv
 from scanner.client.uw_client import UWClient
 from scanner.client.rate_limiter import RateLimiter
 from scanner.rules.engine import RuleEngine
-from scanner.rules.confluence import ConfluenceEnricher
 from scanner.state.dedup import DedupCache
 from scanner.state.db import ScannerDB
 from scanner.output.queue import CandidateQueue
 from scanner.utils.clock import MarketClock
+from scanner.utils.logging import setup_logging
 
 load_dotenv()
 logger = structlog.get_logger()
 
 
-async def run_scanner():
+async def run_scanner(force: bool = False):
     config_path = Path(__file__).resolve().parent.parent.parent / "config" / "rules.yaml"
     if not config_path.exists():
         config_path = Path("config/rules.yaml")
@@ -44,14 +45,14 @@ async def run_scanner():
         rate_limiter=rate_limiter,
     )
     engine = RuleEngine(config)
-    enricher = ConfluenceEnricher(config)
     dedup = DedupCache(
         ttl_minutes=config["dedup"]["ttl_minutes"],
         key_fields=config["dedup"]["key_fields"],
     )
     db_path = config["output"]["sqlite_db_path"]
     if not Path(db_path).is_absolute():
-        db_path = str(config_path.parent.parent / db_path)
+        project_root = config_path.resolve().parent.parent
+        db_path = str(project_root / db_path)
     db = ScannerDB(db_path)
     queue = CandidateQueue(max_size=config["output"]["queue_max_size"])
     clock = MarketClock(config["polling"])
@@ -63,7 +64,7 @@ async def run_scanner():
 
     try:
         while True:
-            if not clock.is_market_hours():
+            if not force and not clock.is_market_hours():
                 wait = clock.seconds_until_open()
                 logger.info("market_closed", sleep_seconds=wait)
                 await asyncio.sleep(min(wait, 300))
@@ -112,10 +113,7 @@ async def run_scanner():
 
                 candidates = engine.evaluate_batch(new_alerts)
 
-                if tide is not None:
-                    candidates = [
-                        enricher.enrich(c, dark_pool, tide) for c in candidates
-                    ]
+                # MVP: Skip ConfluenceEnricher; add dark pool + tide enrichment later
 
                 for candidate in candidates:
                     await db.save_candidate(candidate)
@@ -152,7 +150,11 @@ async def run_scanner():
 
 
 def main():
-    asyncio.run(run_scanner())
+    setup_logging(json_logs=True)
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--force", action="store_true", help="Ignore market hours")
+    args = parser.parse_args()
+    asyncio.run(run_scanner(force=args.force))
 
 
 if __name__ == "__main__":
