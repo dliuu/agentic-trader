@@ -109,7 +109,6 @@ async def run_scanner():
                     }
                     if not dedup.is_duplicate(key_data):
                         new_alerts.append(alert)
-                        dedup.mark_seen(key_data)
 
                 candidates = engine.evaluate_batch(new_alerts)
 

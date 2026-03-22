@@ -115,6 +115,39 @@ class ScannerDB:
         )
         await self._db.commit()
 
+    async def get_candidate(self, id: str) -> dict | None:
+        """Fetch candidate by id. Returns row as dict or None."""
+        cursor = await self._db.execute(
+            "SELECT * FROM candidates WHERE id = ?", (id,)
+        )
+        row = await cursor.fetchone()
+        if row is None:
+            return None
+        columns = [d[0] for d in cursor.description]
+        return dict(zip(columns, row))
+
+    async def get_raw_alert(self, id: str) -> dict | None:
+        """Fetch raw_alert by id."""
+        cursor = await self._db.execute(
+            "SELECT * FROM raw_alerts WHERE id = ?", (id,)
+        )
+        row = await cursor.fetchone()
+        if row is None:
+            return None
+        columns = [d[0] for d in cursor.description]
+        return dict(zip(columns, row))
+
+    async def get_last_cycle(self) -> dict | None:
+        """Fetch most recent scan_cycle."""
+        cursor = await self._db.execute(
+            "SELECT * FROM scan_cycles ORDER BY id DESC LIMIT 1"
+        )
+        row = await cursor.fetchone()
+        if row is None:
+            return None
+        columns = [d[0] for d in cursor.description]
+        return dict(zip(columns, row))
+
     async def close(self):
         if self._db:
             await self._db.close()
