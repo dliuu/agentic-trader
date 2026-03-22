@@ -19,7 +19,7 @@ def check_otm(alert: FlowAlert, cfg: dict) -> SignalMatch | None:
             rule_name="otm",
             weight=1.0,
             detail=f"OTM {pct:.1f}% (strike {alert.strike}, "
-            f"spot {alert.underlying_price})",
+            f"spot {alert.underlying_price or 'N/A'})",
         )
     return None
 
@@ -45,7 +45,7 @@ def check_volume_oi(alert: FlowAlert, cfg: dict) -> SignalMatch | None:
         return SignalMatch(
             rule_name="volume",
             weight=1.0,
-            detail=f"Size {alert.total_size} > OI {alert.open_interest} "
+            detail=f"Size {alert.total_size} > OI {alert.open_interest or 0} "
             f"(ratio {ratio:.1f}x)",
         )
     if ratio >= cfg.get("min_volume_oi_ratio", 2.0):
@@ -59,7 +59,12 @@ def check_volume_oi(alert: FlowAlert, cfg: dict) -> SignalMatch | None:
 
 def check_expiry(alert: FlowAlert, cfg: dict) -> SignalMatch | None:
     """Flag near-term expiry (directional bets, not hedges)."""
-    dte = alert.dte
+    try:
+        dte = alert.dte
+    except (ValueError, TypeError):
+        return None
+    if dte < 0:
+        return None
     if cfg["min_dte"] <= dte <= cfg["max_dte"]:
         return SignalMatch(
             rule_name="expiry",

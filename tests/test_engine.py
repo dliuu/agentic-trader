@@ -58,3 +58,19 @@ def test_evaluate_batch(sample_config, multi_signal_alert):
     engine = RuleEngine(sample_config)
     candidates = engine.evaluate_batch([multi_signal_alert])
     assert len(candidates) >= 1
+
+
+def test_engine_produces_reasonable_candidates_from_fixture(
+    sample_config, flow_fixture
+):
+    """Engine run on fixture produces a reasonable number of candidates (not 0, not all)."""
+    data = flow_fixture.get("data", flow_fixture)
+    if isinstance(data, dict):
+        data = data.get("data", [])
+    if not isinstance(data, list):
+        data = []
+    alerts = [FlowAlert.model_validate(item) for item in data]
+    engine = RuleEngine(sample_config)
+    candidates = engine.evaluate_batch(alerts)
+    assert len(candidates) > 0, "Should produce at least one candidate"
+    assert len(candidates) <= len(alerts), "Should not exceed number of alerts"

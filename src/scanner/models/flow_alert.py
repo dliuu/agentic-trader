@@ -58,8 +58,11 @@ class FlowAlert(BaseModel):
     def dte(self) -> int:
         from datetime import date
 
-        exp = date.fromisoformat(self.expiry)
-        return (exp - date.today()).days
+        try:
+            exp = date.fromisoformat(self.expiry)
+            return (exp - date.today()).days
+        except (ValueError, TypeError):
+            return -1
 
     @property
     def otm_percentage(self) -> float | None:
