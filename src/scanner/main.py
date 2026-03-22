@@ -57,6 +57,8 @@ async def run_scanner(force: bool = False, max_cycles: int | None = None):
         project_root = config_path.resolve().parent.parent
         db_path = str(project_root / db_path)
     db = ScannerDB(db_path)
+    heartbeat_path = Path(db_path).resolve().parent / "heartbeat.txt"
+    heartbeat_path.parent.mkdir(parents=True, exist_ok=True)
     queue = CandidateQueue(max_size=config["output"]["queue_max_size"])
     clock = MarketClock(config["polling"])
 
@@ -152,6 +154,8 @@ async def run_scanner(force: bool = False, max_cycles: int | None = None):
             except Exception as e:
                 logger.exception("cycle_failed", cycle=cycle_count, error=str(e))
 
+            heartbeat_path.write_text(datetime.utcnow().isoformat())
+
             if max_cycles is not None and cycle_count >= max_cycles:
                 break
             await asyncio.sleep(config["polling"]["flow_alerts_interval_seconds"])
@@ -163,7 +167,11 @@ async def run_scanner(force: bool = False, max_cycles: int | None = None):
 
 
 def main():
-    setup_logging(json_logs=True)
+    project_root = Path(__file__).resolve().parent.parent.parent
+    setup_logging(
+        json_logs=True,
+        log_file_path=project_root / "scanner.json.log",
+    )
     parser = argparse.ArgumentParser()
     parser.add_argument("--force", action="store_true", help="Ignore market hours")
     parser.add_argument(
