@@ -22,7 +22,9 @@ from dotenv import load_dotenv
 
 from scanner.client.uw_client import UWClient
 from scanner.client.rate_limiter import RateLimiter
+from scanner.models.market_tide import MarketTide
 from scanner.rules.engine import RuleEngine
+from scanner.rules.confluence import ConfluenceEnricher
 from scanner.state.dedup import DedupCache
 from scanner.state.db import ScannerDB
 from scanner.output.queue import CandidateQueue
@@ -33,7 +35,7 @@ load_dotenv()
 logger = structlog.get_logger()
 
 
-async def run_scanner(force: bool = False):
+async def run_scanner(force: bool = False, max_cycles: int | None = None):
     config_path = Path(__file__).resolve().parent.parent.parent / "config" / "rules.yaml"
     if not config_path.exists():
         config_path = Path("config/rules.yaml")
@@ -45,6 +47,7 @@ async def run_scanner(force: bool = False):
         rate_limiter=rate_limiter,
     )
     engine = RuleEngine(config)
+    enricher = ConfluenceEnricher(config)
     dedup = DedupCache(
         ttl_minutes=config["dedup"]["ttl_minutes"],
         key_fields=config["dedup"]["key_fields"],
@@ -63,7 +66,7 @@ async def run_scanner(force: bool = False):
     logger.info("scanner_started", config_path=str(config_path))
 
     try:
-        while True:
+        while max_cycles is None or cycle_count < max_cycles:
             if not force and not clock.is_market_hours():
                 wait = clock.seconds_until_open()
                 logger.info("market_closed", sleep_seconds=wait)
@@ -113,7 +116,11 @@ async def run_scanner(force: bool = False):
 
                 candidates = engine.evaluate_batch(new_alerts)
 
-                # MVP: Skip ConfluenceEnricher; add dark pool + tide enrichment later
+                # Always enrich: use neutral tide when API failed so dark pool still runs
+                tide_fallback = tide if tide is not None else MarketTide(direction="neutral")
+                candidates = [
+                    enricher.enrich(c, dark_pool, tide_fallback) for c in candidates
+                ]
 
                 for candidate in candidates:
                     await db.save_candidate(candidate)
@@ -128,12 +135,16 @@ async def run_scanner(force: bool = False):
                     errors=errors,
                 )
 
+                dp_confirmed = sum(1 for c in candidates if c.dark_pool_confirmation)
+                tide_aligned = sum(1 for c in candidates if c.market_tide_aligned)
                 logger.info(
                     "cycle_complete",
                     cycle=cycle_count,
                     alerts=len(alerts),
                     new=len(new_alerts),
                     candidates=len(candidates),
+                    dark_pool_confirmed=dp_confirmed,
+                    market_tide_aligned=tide_aligned,
                     dedup_cache_size=dedup.size,
                     duration_ms=int((cycle_end - cycle_start).total_seconds() * 1000),
                 )
@@ -141,6 +152,8 @@ async def run_scanner(force: bool = False):
             except Exception as e:
                 logger.exception("cycle_failed", cycle=cycle_count, error=str(e))
 
+            if max_cycles is not None and cycle_count >= max_cycles:
+                break
             await asyncio.sleep(config["polling"]["flow_alerts_interval_seconds"])
 
     finally:
@@ -153,8 +166,15 @@ def main():
     setup_logging(json_logs=True)
     parser = argparse.ArgumentParser()
     parser.add_argument("--force", action="store_true", help="Ignore market hours")
+    parser.add_argument(
+        "--max-cycles",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Run at most N polling cycles, then exit (default: run indefinitely)",
+    )
     args = parser.parse_args()
-    asyncio.run(run_scanner(force=args.force))
+    asyncio.run(run_scanner(force=args.force, max_cycles=args.max_cycles))
 
 
 if __name__ == "__main__":

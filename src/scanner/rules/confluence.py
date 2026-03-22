@@ -5,7 +5,7 @@ this module checks for confirming signals from other sources:
 dark pool prints and market tide direction.
 """
 from __future__ import annotations
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 import structlog
 
@@ -22,6 +22,13 @@ class ConfluenceEnricher:
         self._tide_cfg = config["filters"]["market_regime"]
         self._weights = config["confluence"]["weights"]
 
+    @staticmethod
+    def _dt_aware(dt: datetime) -> datetime:
+        """Return timezone-aware UTC datetime for comparison."""
+        if dt.tzinfo is None:
+            return dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+
     def enrich(
         self,
         candidate: Candidate,
@@ -31,13 +38,13 @@ class ConfluenceEnricher:
         """Add dark pool and market tide signals to candidate."""
         if self._dp_cfg.get("enabled", True):
             lookback = timedelta(minutes=self._dp_cfg["lookback_minutes"])
-            cutoff = datetime.utcnow() - lookback
+            cutoff = datetime.now(timezone.utc) - lookback
             matching_prints = [
                 dp
                 for dp in dark_pool_prints
                 if dp.ticker == candidate.ticker
                 and dp.notional >= self._dp_cfg["min_notional_usd"]
-                and dp.executed_at >= cutoff
+                and self._dt_aware(dp.executed_at) >= cutoff
             ]
             if matching_prints:
                 candidate.dark_pool_confirmation = True
