@@ -4,12 +4,26 @@
 
 No LLM. Pure Python: async HTTP, Pydantic models, SQLite persistence, structured logging.
 
+**Key features:** Confluence enrichment (dark pool cross-check + market tide alignment), `--force` to bypass market hours, `--max-cycles` for limited runs, dual logging (terminal + `scanner.json.log`), heartbeat file for health checks.
+
+### Run on live market data
+
+```bash
+pip install -e . && cp .env.example .env   # set UW_API_TOKEN in .env
+python -m scanner.main                     # during market hours (9:15–4 ET)
+python -m scanner.main --force --max-cycles 5   # test run (any time)
+```
+
+See [Running on Live Market Data](#running-on-live-market-data) for full setup and options.
+
 ---
 
 ## Table of Contents
 
 - [Architecture Overview](#architecture-overview)
 - [How the Scanner Works](#how-the-scanner-works)
+- [Running on Live Market Data](#running-on-live-market-data)
+- [Benchmarking Results](#benchmarking-results)
 - [Repository Structure](#repository-structure)
 - [Data Models](#data-models)
 - [API Client](#api-client)
@@ -75,9 +89,149 @@ Each polling cycle (default: every 30 seconds during market hours) follows this 
 
 4. **Rule engine evaluation** — Every new alert runs through all enabled filter functions. Each filter returns a `SignalMatch` (with rule name, weight, and human-readable detail) or `None`. If the alert triggers at least `min_signals_required` filters (default: 2), it becomes a `Candidate`.
 
-5. **Confluence enrichment** — Candidates are checked against dark pool prints (same ticker, sufficient notional, within the lookback window) and market tide direction. Confirming signals add weight to the confluence score.
+5. **Confluence enrichment** — Candidates are checked against dark pool prints (same ticker, sufficient notional, within the lookback window) and market tide direction. Confirming signals add weight to the confluence score. Results include `dark_pool_confirmation` and `market_tide_aligned` flags in the database.
 
-6. **Persistence and output** — Candidates are written to SQLite and pushed to an in-memory queue. Cycle metadata (alerts received, candidates flagged, errors, duration) is logged as structured JSON.
+6. **Persistence and output** — Candidates are written to SQLite and pushed to an in-memory queue. Cycle metadata (alerts received, candidates flagged, errors, duration) is logged as structured JSON to both the terminal and `scanner.json.log`.
+
+---
+
+## Running on Live Market Data
+
+### Prerequisites
+
+- Python 3.11+
+- Unusual Whales API token ([get one here](https://unusualwhales.com))
+
+### Quick Start
+
+```bash
+# 1. Create virtual environment and install
+python3.11 -m venv .venv
+source .venv/bin/activate   # On Windows: .venv\Scripts\activate
+pip install -e .
+
+# 2. Configure API token
+cp .env.example .env
+# Edit .env and set UW_API_TOKEN=your_token_here
+
+# 3. Run the scanner (during US market hours)
+python -m scanner.main
+# Or: whale-scanner
+```
+
+### Command-Line Options
+
+| Flag | Description |
+|------|-------------|
+| `--force` | Ignore market hours and poll immediately (for testing or off-hours runs) |
+| `--max-cycles N` | Run at most N polling cycles, then exit (useful for limited test runs) |
+
+### Example Runs
+
+```bash
+# Normal run — polls during market hours (9:15 AM–4:00 PM ET weekdays)
+python -m scanner.main
+
+# Test run — bypass market hours, run 5 cycles and exit
+python -m scanner.main --force --max-cycles 5
+
+# Long-running — leave running to collect live data over days
+nohup python -m scanner.main > /dev/null 2>&1 &
+```
+
+### Output Locations
+
+| Output | Location | Description |
+|--------|----------|-------------|
+| SQLite database | `data/scanner.db` | All candidates, raw alerts, scan cycles |
+| Log file | `scanner.json.log` | Structured JSON logs (appended; also printed to terminal) |
+| Heartbeat | `data/heartbeat.txt` | UTC timestamp updated every cycle (for health checks) |
+
+---
+
+## Benchmarking Results
+
+After running the scanner, use SQLite to analyze performance.
+
+### Quick Stats
+
+```bash
+# Total candidates and breakdown by confluence signals
+sqlite3 data/scanner.db "
+SELECT 
+  COUNT(*) as total_candidates,
+  SUM(dark_pool_confirmation) as dark_pool_confirmed,
+  SUM(market_tide_aligned) as market_tide_aligned
+FROM candidates;
+"
+
+# Candidates per day (by scanned_at date)
+sqlite3 data/scanner.db "
+SELECT date(scanned_at) as day, COUNT(*) as candidates
+FROM candidates
+GROUP BY day
+ORDER BY day DESC
+LIMIT 10;
+"
+
+# Top tickers by candidate count
+sqlite3 data/scanner.db "
+SELECT ticker, COUNT(*) as n
+FROM candidates
+GROUP BY ticker
+ORDER BY n DESC
+LIMIT 20;
+"
+```
+
+### Cycle Health
+
+```bash
+# Recent cycles: alerts received, candidates flagged, errors
+sqlite3 data/scanner.db "
+SELECT id, started_at, alerts_received, candidates_flagged, errors
+FROM scan_cycles
+ORDER BY id DESC
+LIMIT 20;
+"
+
+# Check heartbeat freshness (should update every ~30 seconds during market hours)
+cat data/heartbeat.txt
+```
+
+### Confluence Quality
+
+```bash
+# Candidates with dark pool confirmation (stronger signal)
+sqlite3 data/scanner.db "
+SELECT ticker, direction, premium_usd, confluence_score, scanned_at
+FROM candidates
+WHERE dark_pool_confirmation = 1
+ORDER BY scanned_at DESC
+LIMIT 20;
+"
+
+# High-confluence candidates (score >= 4)
+sqlite3 data/scanner.db "
+SELECT ticker, direction, premium_usd, confluence_score,
+       dark_pool_confirmation, market_tide_aligned, scanned_at
+FROM candidates
+WHERE confluence_score >= 4
+ORDER BY confluence_score DESC, scanned_at DESC;
+"
+```
+
+### Log Analysis
+
+JSON logs in `scanner.json.log` can be parsed with `jq`:
+
+```bash
+# Extract cycle_complete events
+jq -c 'select(.event == "cycle_complete")' scanner.json.log | tail -20
+
+# Average cycle duration
+jq -s 'map(select(.event == "cycle_complete") | .duration_ms) | add / length' scanner.json.log
+```
 
 ---
 
@@ -89,8 +243,12 @@ whale-scanner/
 ├── .gitignore
 ├── pyproject.toml                # Project metadata + dependencies
 ├── README.md
+├── scanner.json.log              # Runtime: JSON logs (stdout + file; gitignored)
 ├── config/
 │   └── rules.yaml                # All tunable parameters — single source of truth
+├── data/                         # Runtime: SQLite, heartbeat (gitignored)
+│   ├── scanner.db
+│   └── heartbeat.txt
 ├── src/
 │   └── scanner/
 │       ├── __init__.py
@@ -121,7 +279,7 @@ whale-scanner/
 │       └── utils/
 │           ├── __init__.py
 │           ├── clock.py          # Market hours helper (timezone-aware)
-│           └── logging.py        # Structured logging setup (JSON via structlog)
+│           └── logging.py        # Structured logging (JSON, stdout + file)
 ├── tests/
 │   ├── conftest.py               # Shared fixtures
 │   ├── fixtures/                 # Saved API response JSON for deterministic tests
@@ -286,7 +444,7 @@ Each filter section has an `enabled` flag and threshold values. Disabling a filt
 
 ## Observability
 
-Every cycle emits a structured JSON log line via `structlog`:
+Logs are emitted as structured JSON to **both** the terminal (stdout) and `scanner.json.log` in the project root. Each cycle produces a log line like:
 
 ```json
 {
@@ -295,57 +453,32 @@ Every cycle emits a structured JSON log line via `structlog`:
   "alerts": 47,
   "new": 12,
   "candidates": 2,
+  "dark_pool_confirmed": 1,
+  "market_tide_aligned": 1,
   "dedup_cache_size": 89,
   "duration_ms": 1840,
   "timestamp": "2026-03-20T15:30:12Z"
 }
 ```
 
-Key metrics to monitor: alerts per cycle (data connectivity), dedup hit rate (trade freshness), candidates per hour (rule tightness), API error rate (rate limiting), and cycle duration (polling drift).
+Key metrics: alerts per cycle (connectivity), dedup hit rate (trade freshness), candidates per hour (rule tightness), `dark_pool_confirmed` / `market_tide_aligned` (confluence quality), and cycle duration (polling drift).
 
-Individual candidate flags are also logged with ticker, direction, score, and matched signal names.
-
-For health monitoring, the scanner can write a heartbeat timestamp to `data/heartbeat.txt` every cycle. A cron job or process monitor can restart the process if the file goes stale.
+A heartbeat file at `data/heartbeat.txt` is updated every cycle with `datetime.utcnow().isoformat()`. Use it with cron or a process monitor to restart if the file goes stale (e.g. no update in 5 minutes).
 
 ---
 
 ## Getting Started
 
-### Requirements
+See [Running on Live Market Data](#running-on-live-market-data) for full setup and run instructions.
 
-- Python 3.11+
-- [Unusual Whales](https://unusualwhales.com) API token
-
-### Installation
+**TL;DR:**
 
 ```bash
-# Clone the repository
-git clone https://github.com/dliuu/agentic-trader.git
-cd agentic-trader
-
-# Create virtual environment
-python3.11 -m venv .venv
-source .venv/bin/activate
-
-# Install in editable mode with dev dependencies
-pip install -e ".[dev]"
-
-# Set up environment
-cp .env.example .env
-# Edit .env and set UW_API_TOKEN=your_token_here
+pip install -e .
+cp .env.example .env   # Set UW_API_TOKEN
+python -m scanner.main --force --max-cycles 3   # Test run
+python -m scanner.main                           # Live during market hours
 ```
-
-### Running
-
-```bash
-# Via module
-python -m scanner.main
-
-# Via entry point
-whale-scanner
-```
-
-The scanner runs during US market hours (configurable in `config/rules.yaml`). Outside those hours it sleeps and re-checks periodically.
 
 ---
 
