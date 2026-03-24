@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import yaml
@@ -19,4 +20,8 @@ def load_config(config_path: str | Path | None = None) -> dict:
         else:
             raise FileNotFoundError(f"Config file not found: {config_path}")
 
-    return yaml.safe_load(config_path.read_text())
+    config = yaml.safe_load(config_path.read_text()) or {}
+    # Inject secrets from environment (not stored in yaml)
+    config["uw_api_token"] = os.environ.get("UW_API_TOKEN", "")
+    config["anthropic_api_key"] = os.environ.get("ANTHROPIC_API_KEY", "")
+    return config

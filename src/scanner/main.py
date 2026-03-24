@@ -35,7 +35,11 @@ load_dotenv()
 logger = structlog.get_logger()
 
 
-async def run_scanner(force: bool = False, max_cycles: int | None = None):
+async def run_scanner(
+    force: bool = False,
+    max_cycles: int | None = None,
+    candidate_queue: asyncio.Queue | None = None,
+):
     config_path = Path(__file__).resolve().parent.parent.parent / "config" / "rules.yaml"
     if not config_path.exists():
         config_path = Path("config/rules.yaml")
@@ -59,7 +63,11 @@ async def run_scanner(force: bool = False, max_cycles: int | None = None):
     db = ScannerDB(db_path)
     heartbeat_path = Path(db_path).resolve().parent / "heartbeat.txt"
     heartbeat_path.parent.mkdir(parents=True, exist_ok=True)
-    queue = CandidateQueue(max_size=config["output"]["queue_max_size"])
+    queue = (
+        candidate_queue
+        if candidate_queue is not None
+        else CandidateQueue(max_size=config["output"]["queue_max_size"])
+    )
     clock = MarketClock(config["polling"])
 
     await db.connect()
@@ -163,6 +171,8 @@ async def run_scanner(force: bool = False, max_cycles: int | None = None):
     finally:
         await client.close()
         await db.close()
+        if candidate_queue is not None:
+            await queue.put(None)  # Sentinel to signal grader to exit
         logger.info("scanner_stopped")
 
 

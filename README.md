@@ -1,27 +1,29 @@
 # Whale Scanner
 
-**Agent A** — a deterministic rule engine that scans for unusual options flow during US market hours. It polls the [Unusual Whales](https://unusualwhales.com) API, applies a configurable set of filters, scores candidates by multi-signal confluence, and emits structured alerts for downstream grading by Agent B.
+A two-agent pipeline for unusual options flow:
 
-No LLM. Pure Python: async HTTP, Pydantic models, SQLite persistence, structured logging.
+- **Agent A (Scanner)** — Deterministic rule engine that scans for unusual options flow during US market hours. Polls the [Unusual Whales](https://unusualwhales.com) API, applies configurable filters, scores candidates by multi-signal confluence, and pushes them to the grader.
+- **Agent B (Grader)** — LLM-powered grading layer (Claude) that scores each candidate 1–100, validates conviction, and emits passing trades to a scored queue.
 
-**Key features:** Confluence enrichment (dark pool cross-check + market tide alignment), `--force` to bypass market hours, `--max-cycles` for limited runs, dual logging (terminal + `scanner.json.log`), heartbeat file for health checks.
+**Key features:** Confluence enrichment (dark pool + market tide), `--force` to bypass market hours, `--max-cycles` for limited runs, dual logging (terminal + `scanner.json.log`), grader pass-through mode (`enabled: false`), and audit logging to SQLite.
 
-### Run on live market data
+### Quick run (full pipeline)
 
 ```bash
-pip install -e . && cp .env.example .env   # set UW_API_TOKEN in .env
-python -m scanner.main                     # during market hours (9:15–4 ET)
-python -m scanner.main --force --max-cycles 5   # test run (any time)
+source .venv/bin/activate
+python -m scanner.run_pipeline --force --max-cycles 3
 ```
 
-See [Running on Live Market Data](#running-on-live-market-data) for full setup and options.
+See [Getting Started](#getting-started) for full venv setup and run instructions.
 
 ---
 
 ## Table of Contents
 
+- [Getting Started](#getting-started)
 - [Architecture Overview](#architecture-overview)
 - [How the Scanner Works](#how-the-scanner-works)
+- [How the Grader Works](#how-the-grader-works)
 - [Running on Live Market Data](#running-on-live-market-data)
 - [Benchmarking Results](#benchmarking-results)
 - [Repository Structure](#repository-structure)
@@ -34,46 +36,97 @@ See [Running on Live Market Data](#running-on-live-market-data) for full setup a
   - [Deduplication](#deduplication)
   - [SQLite Persistence](#sqlite-persistence)
 - [Configuration Reference](#configuration-reference)
+- [Grader Configuration](#grader-configuration)
 - [Observability](#observability)
-- [Getting Started](#getting-started)
 - [Testing](#testing)
 - [Deployment](#deployment)
 - [License](#license)
 
 ---
 
+## Getting Started
+
+### Prerequisites
+
+- **Python 3.11+** (required; the project does not support Python 3.9 or 3.10)
+- [Unusual Whales](https://unusualwhales.com) API token
+- [Anthropic](https://console.anthropic.com/) API key (for the grader)
+
+### Step 1: Create and activate the virtual environment
+
+```bash
+cd whale-scanner
+
+# Create venv with Python 3.11
+python3.11 -m venv .venv
+
+# Activate (macOS/Linux)
+source .venv/bin/activate
+
+# Activate (Windows)
+.venv\Scripts\activate
+```
+
+### Step 2: Install the project
+
+```bash
+pip install -e ".[dev,grader]"
+```
+
+This installs the project in editable mode with dev tools (pytest, respx) and grader dependencies (anthropic SDK).
+
+### Step 3: Configure API keys
+
+```bash
+cp .env.example .env
+```
+
+Edit `.env` and set:
+
+```
+UW_API_TOKEN=your_unusual_whales_token
+ANTHROPIC_API_KEY=your_anthropic_api_key
+```
+
+### Step 4: Run the pipeline
+
+```bash
+# Full pipeline (scanner + grader) — test run, 3 cycles
+python -m scanner.run_pipeline --force --max-cycles 3
+
+# Full pipeline — live during market hours (runs indefinitely)
+python -m scanner.run_pipeline
+
+# Scanner only (no grading)
+python -m scanner.main --force --max-cycles 3
+```
+
+### Stop a running pipeline
+
+Press **`Ctrl+C`** in the terminal to interrupt the process.
+
+---
+
 ## Architecture Overview
 
 ```
-┌──────────────────────────────────────────────────────────┐
-│                    Main Orchestrator Loop                  │
-│                                                            │
-│   ┌─────────┐    ┌───────────┐    ┌──────────────────┐   │
-│   │ Market   │───▶│ UW API    │───▶│ Deduplication    │   │
-│   │ Clock    │    │ Client    │    │ Cache            │   │
-│   └─────────┘    └───────────┘    └──────────────────┘   │
-│                        │                    │              │
-│                        │          ┌─────────▼──────────┐  │
-│               ┌────────┘          │ Rule Engine         │  │
-│               │                   │ (5 filter functions) │  │
-│               │                   └─────────┬──────────┘  │
-│               │                             │              │
-│       ┌───────▼─────────┐       ┌──────────▼───────────┐ │
-│       │ Dark Pool +     │──────▶│ Confluence Enricher   │ │
-│       │ Market Tide     │       │ (cross-signal scoring) │ │
-│       └─────────────────┘       └──────────┬───────────┘ │
-│                                            │              │
-│                              ┌─────────────▼────────┐    │
-│                              │ SQLite DB + Queue     │    │
-│                              │ (persist + emit)      │    │
-│                              └──────────────────────┘    │
-└──────────────────────────────────────────────────────────┘
-                                      │
-                                      ▼
-                              Agent B (Grader)
+┌─────────────────────────────────────────────────────────────────────┐
+│                     Full Pipeline (run_pipeline)                      │
+│                                                                       │
+│  ┌─────────────────────────────────────┐  ┌────────────────────────┐ │
+│  │         Agent A (Scanner)            │  │     Agent B (Grader)    │ │
+│  │                                      │  │                         │ │
+│  │  Market Clock → UW API → Dedup       │  │  Candidate Queue        │ │
+│  │       → Rule Engine → Confluence     │──▶│       → Context Builder │ │
+│  │       → SQLite + Queue               │  │       → Claude (LLM)    │ │
+│  │                                      │  │       → Parser → Score  │ │
+│  └─────────────────────────────────────┘  └───────────┬────────────┘ │
+│                                                       │              │
+│                                            Scored Queue → (Agent C)   │
+└─────────────────────────────────────────────────────────────────────┘
 ```
 
-The scanner runs as a single async Python process. Every cycle it concurrently fetches three data sources from the Unusual Whales API (flow alerts, dark pool prints, market tide), deduplicates against recently seen trades, runs each alert through a chain of configurable filter functions, enriches passing candidates with cross-signal confluence data, persists everything to SQLite, and pushes candidates into an in-memory queue for Agent B consumption.
+The scanner runs as an async producer: every cycle it fetches flow alerts, dark pool prints, and market tide from the Unusual Whales API, deduplicates, runs the rule engine, enriches with confluence data, persists to SQLite, and pushes candidates into a shared queue. The grader runs concurrently as a consumer: it pulls candidates, enriches them with quote/greeks/news/insider data via the context builder, sends them to Claude for scoring, parses the JSON response, and pushes passing trades (score ≥ threshold) to the scored queue. Both agents share `src/shared/` (models, config, db).
 
 ---
 
@@ -95,29 +148,24 @@ Each polling cycle (default: every 30 seconds during market hours) follows this 
 
 ---
 
+## How the Grader Works
+
+Agent B (the grader) consumes candidates from the shared queue and runs them through:
+
+1. **Context builder** — Fetches quote, greeks, news, insider/congressional trades from the Unusual Whales API (concurrent, with graceful degradation on partial failures).
+2. **Prompt assembly** — Renders system + user prompts from `GradingContext`, including the `GradeResponse` JSON schema.
+3. **LLM call** — Sends to Claude (default: `claude-sonnet-4-20250514`) with a 512-token limit.
+4. **Parse & validate** — Strips markdown fences, extracts JSON, validates with Pydantic. On parse failure, retries once.
+5. **Audit** — Writes every grading decision to the `grades` table in `data/trades.db`.
+6. **Routing** — If score ≥ `score_threshold` (default 70), emits a `ScoredTrade` to the scored queue; otherwise returns `None`.
+
+With `grader.enabled: false` in config, the grader skips LLM calls and passes candidates through as `ScoredTrade` with `grade=None`.
+
+---
+
 ## Running on Live Market Data
 
-### Prerequisites
-
-- Python 3.11+
-- Unusual Whales API token ([get one here](https://unusualwhales.com))
-
-### Quick Start
-
-```bash
-# 1. Create virtual environment and install
-python3.11 -m venv .venv
-source .venv/bin/activate   # On Windows: .venv\Scripts\activate
-pip install -e .
-
-# 2. Configure API token
-cp .env.example .env
-# Edit .env and set UW_API_TOKEN=your_token_here
-
-# 3. Run the scanner (during US market hours)
-python -m scanner.main
-# Or: whale-scanner
-```
+Ensure the venv is activated and API keys are set (see [Getting Started](#getting-started)).
 
 ### Command-Line Options
 
@@ -129,23 +177,25 @@ python -m scanner.main
 ### Example Runs
 
 ```bash
-# Normal run — polls during market hours (9:15 AM–4:00 PM ET weekdays)
-python -m scanner.main
+# Full pipeline (scanner + grader) — test run, 5 cycles
+python -m scanner.run_pipeline --force --max-cycles 5
 
-# Test run — bypass market hours, run 5 cycles and exit
+# Full pipeline — live during market hours
+python -m scanner.run_pipeline
+
+# Scanner only (no grader)
 python -m scanner.main --force --max-cycles 5
-
-# Long-running — leave running to collect live data over days
-nohup python -m scanner.main > /dev/null 2>&1 &
+python -m scanner.main
 ```
 
 ### Output Locations
 
 | Output | Location | Description |
 |--------|----------|-------------|
-| SQLite database | `data/scanner.db` | All candidates, raw alerts, scan cycles |
-| Log file | `scanner.json.log` | Structured JSON logs (appended; also printed to terminal) |
-| Heartbeat | `data/heartbeat.txt` | UTC timestamp updated every cycle (for health checks) |
+| Scanner DB | `data/scanner.db` | Candidates, raw alerts, scan cycles |
+| Grader DB | `data/trades.db` | Grades table (score, verdict, rationale, token counts) |
+| Log file | `scanner.json.log` | Structured JSON logs (terminal + file) |
+| Heartbeat | `data/heartbeat.txt` | UTC timestamp updated every cycle |
 
 ---
 
@@ -239,59 +289,76 @@ jq -s 'map(select(.event == "cycle_complete") | .duration_ms) | add / length' sc
 
 ```
 whale-scanner/
-├── .env.example                  # Template for secrets (UW_API_TOKEN)
+├── .env.example                  # Template for secrets (UW_API_TOKEN, ANTHROPIC_API_KEY)
 ├── .gitignore
+├── .github/workflows/test.yml    # CI: pytest on push/PR
 ├── pyproject.toml                # Project metadata + dependencies
 ├── README.md
 ├── scanner.json.log              # Runtime: JSON logs (stdout + file; gitignored)
 ├── config/
-│   └── rules.yaml                # All tunable parameters — single source of truth
+│   └── rules.yaml                # Scanner + grader config — single source of truth
 ├── data/                         # Runtime: SQLite, heartbeat (gitignored)
-│   ├── scanner.db
+│   ├── scanner.db                # Scanner candidates, raw alerts, cycles
+│   ├── trades.db                 # Grader grades table
 │   └── heartbeat.txt
 ├── src/
-│   └── scanner/
+│   ├── shared/                   # Cross-agent code
+│   │   ├── __init__.py
+│   │   ├── models.py             # Candidate, SignalMatch
+│   │   ├── db.py                 # SQLite connection + grades/scans/executions tables
+│   │   └── config.py             # YAML loader + env injection
+│   ├── scanner/
+│   │   ├── __init__.py
+│   │   ├── main.py               # Scanner loop
+│   │   ├── run_pipeline.py       # Full pipeline: scanner + grader
+│   │   ├── client/
+│   │   │   ├── uw_client.py
+│   │   │   └── rate_limiter.py
+│   │   ├── models/
+│   │   │   ├── flow_alert.py
+│   │   │   ├── dark_pool.py
+│   │   │   ├── market_tide.py
+│   │   │   └── candidate.py      # Re-exports from shared
+│   │   ├── rules/
+│   │   │   ├── engine.py
+│   │   │   ├── filters.py
+│   │   │   └── confluence.py
+│   │   ├── state/
+│   │   │   ├── dedup.py
+│   │   │   └── db.py             # Scanner-specific SQLite (candidates, raw_alerts)
+│   │   ├── output/
+│   │   │   ├── queue.py
+│   │   │   └── notifier.py
+│   │   └── utils/
+│   │       ├── clock.py
+│   │       └── logging.py
+│   └── grader/
 │       ├── __init__.py
-│       ├── main.py               # Entry point — async orchestrator loop
-│       ├── client/
-│       │   ├── __init__.py
-│       │   ├── uw_client.py      # Unusual Whales API wrapper (endpoint whitelist)
-│       │   └── rate_limiter.py   # Token bucket rate limiter
-│       ├── models/
-│       │   ├── __init__.py
-│       │   ├── flow_alert.py     # Pydantic model for raw flow alerts
-│       │   ├── dark_pool.py      # Pydantic model for dark pool prints
-│       │   ├── market_tide.py    # Pydantic model for market sentiment
-│       │   └── candidate.py      # Output model — what Agent B receives
-│       ├── rules/
-│       │   ├── __init__.py
-│       │   ├── engine.py         # Core rule engine — registry + batch evaluation
-│       │   ├── filters.py        # Individual filter functions (pure, no side effects)
-│       │   └── confluence.py     # Cross-signal enrichment (dark pool + market tide)
-│       ├── state/
-│       │   ├── __init__.py
-│       │   ├── dedup.py          # TTL-based deduplication cache
-│       │   └── db.py             # SQLite persistence (candidates, raw alerts, cycles)
-│       ├── output/
-│       │   ├── __init__.py
-│       │   ├── queue.py          # In-memory async queue for Agent B
-│       │   └── notifier.py       # Optional Slack/Discord webhook alerts
-│       └── utils/
-│           ├── __init__.py
-│           ├── clock.py          # Market hours helper (timezone-aware)
-│           └── logging.py        # Structured logging (JSON, stdout + file)
+│       ├── main.py               # Consumer loop: candidate_queue → scored_queue
+│       ├── grader.py             # Orchestrator (context → LLM → parse → log)
+│       ├── context_builder.py    # Enriches Candidate with quote, greeks, news, insider
+│       ├── prompt.py             # System + user prompt templates
+│       ├── llm_client.py         # Anthropic SDK wrapper
+│       ├── parser.py             # JSON extract + GradeResponse validation
+│       └── models.py             # GradingContext, GradeResponse, ScoredTrade
 ├── tests/
-│   ├── conftest.py               # Shared fixtures
-│   ├── fixtures/                 # Saved API response JSON for deterministic tests
+│   ├── conftest.py
+│   ├── fixtures/
 │   ├── test_client.py
 │   ├── test_filters.py
 │   ├── test_engine.py
 │   ├── test_confluence.py
 │   ├── test_dedup.py
-│   └── test_integration.py
+│   ├── test_integration.py
+│   ├── test_grader_models.py
+│   ├── test_context_builder.py
+│   ├── test_prompt.py
+│   ├── test_llm_client.py
+│   ├── test_parser.py
+│   └── test_grader.py
 ├── scripts/
-│   ├── backfill.py               # Pull historical flow for backtesting
-│   └── replay.py                 # Replay saved JSON through the engine
+│   ├── backfill.py
+│   └── replay.py
 └── docker/
     ├── Dockerfile
     └── docker-compose.yaml
@@ -316,7 +383,7 @@ Represents a single raw options flow alert from `/api/option-trades/flow-alerts`
 
 ### Candidate
 
-The output model emitted to Agent B. Contains the original alert data plus the scanner's analysis:
+Defined in `shared/models.py`. The output model emitted from scanner to grader:
 
 | Field | Description |
 |---|---|
@@ -325,6 +392,10 @@ The output model emitted to Agent B. Contains the original alert data plus the s
 | `dark_pool_confirmation` | Whether a matching dark pool print was found |
 | `market_tide_aligned` | Whether market sentiment agrees with the signal direction |
 | `raw_alert_id` | Original UW API alert ID for traceability |
+
+### ScoredTrade and GradeResponse
+
+Defined in `grader/models.py`. A `ScoredTrade` is a candidate that passed grading (score ≥ threshold). It wraps the `Candidate`, a `GradeResponse` (score 1–100, verdict pass/fail, rationale, signals_confirmed), and metadata (model_used, latency_ms, token counts). In pass-through mode, `grade` may be `None`.
 
 ### DarkPoolPrint and MarketTide
 
@@ -396,15 +467,9 @@ The `DedupCache` prevents the same trade from being flagged across consecutive p
 
 ### SQLite Persistence
 
-`ScannerDB` uses `aiosqlite` to store three tables:
+**Scanner DB** (`data/scanner.db`): `ScannerDB` stores candidates, raw alerts, and scan cycles.
 
-| Table | Purpose |
-|---|---|
-| `candidates` | Every candidate the scanner flags, including signals JSON, confluence score, and downstream outcome fields (`graded_at`, `grade_score`, `outcome`) for Agent B to populate |
-| `raw_alerts` | Raw API payloads for replay and backtesting |
-| `scan_cycles` | Per-cycle metadata: start/end times, alert count, candidate count, error count |
-
-The database is zero-config (SQLite file at `data/scanner.db`), survives restarts, and provides full traceability from raw alert to final outcome.
+**Grader DB** (`data/trades.db`): `shared.db.get_db()` creates the `grades` table. Every grading call writes a row (candidate_id, score, verdict, rationale, model, token counts, latency).
 
 ---
 
@@ -442,6 +507,21 @@ Each filter section has an `enabled` flag and threshold values. Disabling a filt
 
 ---
 
+## Grader Configuration
+
+The `grader` section in `config/rules.yaml` controls Agent B:
+
+| Parameter | Default | Description |
+|---|---|---|
+| `score_threshold` | 70 | Minimum score to emit a ScoredTrade (1–100) |
+| `model` | `claude-sonnet-4-20250514` | Claude model for grading |
+| `max_tokens` | 512 | Max output tokens per LLM call |
+| `timeout_seconds` | 15 | LLM request timeout |
+| `max_parse_retries` | 1 | Retries on JSON parse failure |
+| `enabled` | `true` | If `false`, pass-through mode (no LLM, grade=None) |
+
+---
+
 ## Observability
 
 Logs are emitted as structured JSON to **both** the terminal (stdout) and `scanner.json.log` in the project root. Each cycle produces a log line like:
@@ -467,35 +547,34 @@ A heartbeat file at `data/heartbeat.txt` is updated every cycle with `datetime.u
 
 ---
 
-## Getting Started
-
-See [Running on Live Market Data](#running-on-live-market-data) for full setup and run instructions.
-
-**TL;DR:**
+## Getting Started (TL;DR)
 
 ```bash
-pip install -e .
-cp .env.example .env   # Set UW_API_TOKEN
-python -m scanner.main --force --max-cycles 3   # Test run
-python -m scanner.main                           # Live during market hours
+cd whale-scanner
+python3.11 -m venv .venv
+source .venv/bin/activate
+pip install -e ".[dev,grader]"
+cp .env.example .env   # Set UW_API_TOKEN and ANTHROPIC_API_KEY
+python -m scanner.run_pipeline --force --max-cycles 3
 ```
+
+See [Getting Started](#getting-started) for full instructions.
 
 ---
 
 ## Testing
 
-Tests use `pytest` with `pytest-asyncio` for async support and `respx` for mocking `httpx` HTTP calls against saved JSON fixtures.
+Tests use `pytest` with `pytest-asyncio` for async support and `respx` for mocking HTTP calls.
 
 ```bash
-# Run all tests
-pytest
-
-# Run with verbose output
+# Run all tests (scanner + grader)
 pytest -v
 
-# Run a specific test file
-pytest tests/test_filters.py
+# Run grader tests only
+pytest tests/test_grader.py tests/test_grader_models.py tests/test_context_builder.py tests/test_prompt.py tests/test_llm_client.py tests/test_parser.py -v
 ```
+
+Ensure the venv is activated and the project is installed (`pip install -e ".[dev,grader]"`).
 
 ### Capturing test fixtures
 
@@ -538,15 +617,17 @@ A $5/month VPS (1 CPU, 1 GB RAM) is sufficient. The scanner is I/O-bound (waitin
 
 | Package | Purpose |
 |---|---|
-| `httpx` | Async HTTP client with clean timeout/retry semantics |
-| `pydantic` | Data validation — catches API schema drift immediately |
-| `pyyaml` | Configuration file parsing |
-| `python-dotenv` | `.env` file loading for secrets |
-| `structlog` | Structured JSON logging with context fields |
-| `aiosqlite` | Async SQLite for zero-config persistence |
-| `asyncio-throttle` | Rate limiting helper |
+| `httpx` | Async HTTP client |
+| `pydantic` | Data validation |
+| `pyyaml` | Configuration parsing |
+| `python-dotenv` | `.env` loading |
+| `structlog` | Structured JSON logging |
+| `aiosqlite` | Async SQLite |
+| `asyncio-throttle` | Rate limiting |
 
-Dev dependencies: `pytest`, `pytest-asyncio`, `respx` (httpx mocking), `ruff` (linter/formatter), `mypy` (type checking).
+Optional `grader` extra: `anthropic` (Claude SDK).
+
+Dev: `pytest`, `pytest-asyncio`, `respx`, `ruff`, `mypy`.
 
 ---
 

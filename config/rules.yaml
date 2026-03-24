@@ -84,3 +84,12 @@ output:
   queue_max_size: 100
   sqlite_db_path: "data/scanner.db"
   slack_webhook_url: null     # Set in .env if desired
+
+# Grader (Agent B) — LLM-powered trade grading
+grader:
+  score_threshold: 70
+  model: "claude-sonnet-4-20250514"
+  max_tokens: 512
+  timeout_seconds: 15
+  max_parse_retries: 1
+  enabled: true               # Toggle to disable grading (pass-through mode)

@@ -76,7 +76,7 @@ class ScoredTrade(BaseModel):
     """A candidate that passed grading. Sent to the executor queue."""
 
     candidate: Candidate
-    grade: GradeResponse
+    grade: GradeResponse | None = None  # None in pass-through mode when grading disabled
     graded_at: datetime
     model_used: str
     latency_ms: int
