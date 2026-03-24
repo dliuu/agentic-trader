@@ -9,7 +9,7 @@ from datetime import datetime, timedelta, timezone
 
 import structlog
 
-from scanner.models.candidate import Candidate, SignalMatch
+from shared.models import Candidate, SignalMatch
 from scanner.models.dark_pool import DarkPoolPrint
 from scanner.models.market_tide import MarketTide
 

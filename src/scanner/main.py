@@ -17,7 +17,6 @@ from datetime import datetime
 from pathlib import Path
 
 import structlog
-import yaml
 from dotenv import load_dotenv
 
 from scanner.client.uw_client import UWClient
@@ -30,6 +29,7 @@ from scanner.state.db import ScannerDB
 from scanner.output.queue import CandidateQueue
 from scanner.utils.clock import MarketClock
 from scanner.utils.logging import setup_logging
+from shared.config import load_config
 
 load_dotenv()
 logger = structlog.get_logger()
@@ -39,7 +39,7 @@ async def run_scanner(force: bool = False, max_cycles: int | None = None):
     config_path = Path(__file__).resolve().parent.parent.parent / "config" / "rules.yaml"
     if not config_path.exists():
         config_path = Path("config/rules.yaml")
-    config = yaml.safe_load(config_path.read_text())
+    config = load_config(config_path)
 
     rate_limiter = RateLimiter(calls_per_minute=30)
     client = UWClient(

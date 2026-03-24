@@ -1,7 +1,7 @@
 import pytest
 from datetime import datetime, timedelta
 
-from scanner.models.candidate import Candidate, SignalMatch
+from shared.models import Candidate, SignalMatch
 from scanner.models.dark_pool import DarkPoolPrint
 from scanner.models.market_tide import MarketTide
 from scanner.rules.confluence import ConfluenceEnricher

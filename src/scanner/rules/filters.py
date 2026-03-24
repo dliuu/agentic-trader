@@ -4,7 +4,7 @@ from __future__ import annotations
 # Each filter takes a FlowAlert and the config, returns a SignalMatch if the rule
 # triggers or None if it doesn't. Filters are pure functions — no side effects.
 from scanner.models.flow_alert import FlowAlert
-from scanner.models.candidate import SignalMatch
+from shared.models import SignalMatch
 
 
 def check_otm(alert: FlowAlert, cfg: dict) -> SignalMatch | None:

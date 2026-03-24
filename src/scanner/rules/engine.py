@@ -10,7 +10,7 @@ from datetime import datetime
 import structlog
 
 from scanner.models.flow_alert import FlowAlert
-from scanner.models.candidate import Candidate, SignalMatch
+from shared.models import Candidate, SignalMatch
 from scanner.rules import filters
 
 logger = structlog.get_logger()

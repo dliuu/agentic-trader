@@ -2,7 +2,7 @@
 import pytest
 from datetime import datetime
 
-from scanner.models.candidate import Candidate, SignalMatch
+from shared.models import Candidate, SignalMatch
 from scanner.state.db import ScannerDB
 
 
