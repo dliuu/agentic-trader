@@ -31,17 +31,12 @@ USER_TEMPLATE = """Grade this unusual options trade:
 - Expiry: {expiry}
 - Premium paid: ${premium:,.0f}
 - Fill type: {fill_type}
-- Volume: {volume}
-- Open interest: {open_interest}
-- OI change vs 20d avg: {oi_change}
+{flow_optional_block}
 
 ## Current market data
 - Spot price: ${current_spot:.2f}
 - Distance from strike: {otm_pct:.1f}% OTM
-- Daily volume: {daily_volume:,}
-- Avg daily volume: {avg_daily_volume}
-- Sector: {sector}
-- Market cap: {market_cap}
+{market_optional_block}
 
 ## Greeks
 {greeks_block}
@@ -117,11 +112,23 @@ def build_user_prompt(ctx: GradingContext) -> str:
     # option_type: Call for bullish, Put for bearish
     option_type = "CALL" if c.direction == "bullish" else "PUT"
     fill_type = c.execution_type or "N/A"
-    # Candidate lacks volume, open_interest, oi_change — use N/A
-    volume = "N/A"
-    open_interest = "N/A"
-    oi_change = "N/A"
     expiry_str = c.expiry if isinstance(c.expiry, str) else c.expiry.strftime("%Y-%m-%d")
+
+    # Avoid walls of "N/A" — omit sections when data is missing.
+    flow_optional_lines: list[str] = []
+    # Candidate currently doesn't carry volume / OI / OI change; omit them entirely.
+    flow_optional_block = "\n".join(flow_optional_lines) if flow_optional_lines else "- (Additional flow fields unavailable)"
+
+    market_optional_lines: list[str] = []
+    if ctx.daily_volume:
+        market_optional_lines.append(f"- Daily volume: {ctx.daily_volume:,}")
+    if ctx.avg_daily_volume:
+        market_optional_lines.append(f"- Avg daily volume: {ctx.avg_daily_volume:,}")
+    if ctx.sector:
+        market_optional_lines.append(f"- Sector: {ctx.sector}")
+    if ctx.market_cap:
+        market_optional_lines.append(f"- Market cap: ${ctx.market_cap:,.0f}")
+    market_optional_block = "\n".join(market_optional_lines) if market_optional_lines else "- (Additional market fields unavailable)"
 
     return USER_TEMPLATE.format(
         ticker=c.ticker,
@@ -130,15 +137,10 @@ def build_user_prompt(ctx: GradingContext) -> str:
         expiry=expiry_str,
         premium=c.premium_usd,
         fill_type=fill_type,
-        volume=volume,
-        open_interest=open_interest,
-        oi_change=oi_change,
+        flow_optional_block=flow_optional_block,
         current_spot=ctx.current_spot,
         otm_pct=otm_pct,
-        daily_volume=ctx.daily_volume,
-        avg_daily_volume=f"{ctx.avg_daily_volume:,}" if ctx.avg_daily_volume else "N/A",
-        sector=ctx.sector or "Unknown",
-        market_cap=f"${ctx.market_cap:,.0f}" if ctx.market_cap else "Unknown",
+        market_optional_block=market_optional_block,
         greeks_block=greeks_block,
         news_block=news_block,
         insider_block=insider_block,

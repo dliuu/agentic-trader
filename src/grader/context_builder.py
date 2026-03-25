@@ -14,29 +14,35 @@ from grader.models import GradingContext, Greeks, InsiderTrade, NewsItem
 
 log = structlog.get_logger()
 
+INDEX_TICKERS = {"SPX", "SPXW", "NDX", "RUT", "VIX", "DJX"}
+
 
 class ContextBuilder:
     """Enriches a Candidate with market data, news, and insider activity."""
 
     def __init__(self, uw_client: httpx.AsyncClient, api_token: str):
         self._client = uw_client
-        self._headers = {"Authorization": f"Bearer {api_token}"}
+        # Match scanner's auth headers (client_id is required by many UW endpoints).
+        self._headers = {
+            "Authorization": f"Bearer {api_token}",
+            "UW-CLIENT-API-ID": "100001",
+            "Accept": "application/json",
+        }
 
     async def build(self, candidate: Candidate) -> GradingContext:
         """Gather all context in parallel, returning a complete GradingContext."""
+        ticker = candidate.ticker
+        is_index = ticker in INDEX_TICKERS
+
         results = await asyncio.gather(
-            self._fetch_quote(candidate.ticker),
-            self._fetch_greeks(candidate.ticker, candidate.strike, candidate.expiry),
-            self._fetch_news(candidate.ticker),
-            self._fetch_insider_trades(candidate.ticker),
-            self._fetch_congressional_trades(candidate.ticker),
+            self._fetch_greeks_screener(ticker, candidate.strike, candidate.expiry),
+            self._fetch_news(ticker) if not is_index else self._empty_list(),
+            self._fetch_insider_trades(ticker) if not is_index else self._empty_list(),
+            self._fetch_congressional_trades(ticker) if not is_index else self._empty_list(),
             return_exceptions=True,
         )
-        quote, greeks, news, insider, congress = results
+        greeks, news, insider, congress = results
 
-        if isinstance(quote, Exception):
-            log.warning("context_quote_failed", ticker=candidate.ticker, error=str(quote))
-            quote = {}
         if isinstance(greeks, Exception):
             log.warning("context_greeks_failed", ticker=candidate.ticker, error=str(greeks))
             greeks = None
@@ -50,11 +56,13 @@ class ContextBuilder:
             log.warning("context_congress_failed", ticker=candidate.ticker, error=str(congress))
             congress = []
 
-        current_spot = float(quote.get("price", candidate.underlying_price or candidate.strike))
-        daily_volume = int(quote.get("volume", 0))
-        avg_daily_volume = quote.get("avg_volume")
-        sector = quote.get("sector")
-        market_cap = quote.get("market_cap")
+        # Quote endpoints are not on the validated whitelist and 404 for index tickers.
+        # Fall back to scanner-provided underlying_price.
+        current_spot = float(candidate.underlying_price or candidate.strike)
+        daily_volume = 0
+        avg_daily_volume = None
+        sector = None
+        market_cap = None
 
         return GradingContext(
             candidate=candidate,
@@ -69,24 +77,13 @@ class ContextBuilder:
             market_cap=float(market_cap) if market_cap is not None else None,
         )
 
-    async def _fetch_quote(self, ticker: str) -> dict:
-        """GET /api/stock/{ticker}/quote"""
+    async def _fetch_greeks_screener(self, ticker: str, strike: float, expiry: str) -> Greeks:
+        """Fetch greeks via the validated options screener endpoint."""
         resp = await self._client.get(
-            f"https://api.unusualwhales.com/api/stock/{ticker}/quote",
+            "https://api.unusualwhales.com/api/screener/option-contracts",
             headers=self._headers,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        if isinstance(data, dict):
-            return data.get("data", data)
-        return {}
-
-    async def _fetch_greeks(self, ticker: str, strike: float, expiry: str) -> Greeks:
-        """Fetch contract greeks for a ticker/strike/expiry tuple."""
-        resp = await self._client.get(
-            f"https://api.unusualwhales.com/api/stock/{ticker}/option-contracts",
-            headers=self._headers,
-            params={"strike": strike, "expiry": expiry},
+            # API params are not fully standardized across tiers; keep minimal + degrade gracefully.
+            params={"ticker": ticker, "strike": strike, "expiry": expiry, "limit": 1},
         )
         resp.raise_for_status()
         data = resp.json()
@@ -114,9 +111,14 @@ class ContextBuilder:
         for item in items[:5]:
             parsed.append(
                 NewsItem(
-                    headline=item["headline"],
+                    headline=item.get("headline") or item.get("title") or "",
                     source=item.get("source", "unknown"),
-                    published_at=self._parse_dt(item["published_at"]),
+                    published_at=self._parse_dt(
+                        item.get("published_at")
+                        or item.get("created_at")
+                        or item.get("timestamp")
+                        or ""
+                    ),
                 )
             )
         return parsed
@@ -135,12 +137,14 @@ class ContextBuilder:
         for item in items[:5]:
             trades.append(
                 InsiderTrade(
-                    name=item["insider_name"],
-                    title=item.get("insider_title"),
-                    trade_type=item["transaction_type"],
+                    name=item.get("insider_name") or item.get("name") or "",
+                    title=item.get("insider_title") or item.get("title"),
+                    trade_type=item.get("transaction_type") or item.get("trade_type") or "unknown",
                     shares=int(item.get("shares", 0)),
                     value=float(item.get("value", 0)),
-                    filed_at=self._parse_dt(item["filed_at"]),
+                    filed_at=self._parse_dt(
+                        item.get("filed_at") or item.get("created_at") or item.get("timestamp") or ""
+                    ),
                 )
             )
         return trades
@@ -159,18 +163,26 @@ class ContextBuilder:
         for item in items[:5]:
             trades.append(
                 InsiderTrade(
-                    name=item["politician_name"],
-                    title=item.get("chamber"),
-                    trade_type=item["transaction_type"],
+                    name=item.get("politician_name") or item.get("name") or "",
+                    title=item.get("chamber") or item.get("title"),
+                    trade_type=item.get("transaction_type") or item.get("trade_type") or "unknown",
                     shares=int(item.get("shares", 0)),
                     value=float(item.get("value", 0)),
-                    filed_at=self._parse_dt(item["filed_at"]),
+                    filed_at=self._parse_dt(
+                        item.get("filed_at") or item.get("created_at") or item.get("timestamp") or ""
+                    ),
                 )
             )
         return trades
 
     @staticmethod
     def _parse_dt(value: str) -> datetime:
+        if not value:
+            return datetime.utcnow()
         if value.endswith("Z"):
             value = value.replace("Z", "+00:00")
         return datetime.fromisoformat(value)
+
+    @staticmethod
+    async def _empty_list() -> list:
+        return []

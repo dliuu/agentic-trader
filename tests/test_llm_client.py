@@ -14,7 +14,7 @@ def mock_anthropic(monkeypatch):
     mock_message.content = [MagicMock(text='{"score": 75, "verdict": "pass", "rationale": "Test.", "signals_confirmed": [], "likely_directional": true}')]
     mock_message.usage = MagicMock(input_tokens=100, output_tokens=50)
 
-    async def fake_create(*, model, max_tokens, system, messages):
+    async def fake_create(*, model, max_tokens, system, messages, temperature=None, **_):
         return mock_message
 
     mock_client = MagicMock()

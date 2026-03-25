@@ -49,19 +49,7 @@ def sample_candidate() -> Candidate:
 
 def _register_uw_routes() -> None:
     """Mock all context builder API endpoints."""
-    respx.get("https://api.unusualwhales.com/api/stock/ACME/quote").mock(
-        return_value=httpx.Response(
-            200,
-            json={
-                "price": 150.25,
-                "volume": 1234567,
-                "avg_volume": 1000000,
-                "sector": "Technology",
-                "market_cap": 12_500_000_000,
-            },
-        )
-    )
-    respx.get("https://api.unusualwhales.com/api/stock/ACME/option-contracts").mock(
+    respx.get("https://api.unusualwhales.com/api/screener/option-contracts").mock(
         return_value=httpx.Response(200, json={"data": []})
     )
     respx.get("https://api.unusualwhales.com/api/news/headlines").mock(

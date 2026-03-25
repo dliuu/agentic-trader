@@ -88,8 +88,17 @@ def _extract_json(text: str) -> str:
 
 
 # Retry prompt for when parsing fails
-RETRY_PROMPT = (
-    "Your previous response was not valid JSON. "
-    "Respond with ONLY a JSON object matching this schema, "
-    "no other text:\n{schema}"
-)
+RETRY_PROMPT = """Your previous response could not be parsed. Error: {error}
+
+Respond with ONLY a JSON object matching this exact schema:
+{{
+  "score": <integer 1-100>,
+  "verdict": "pass" or "fail",
+  "rationale": "<1-2 sentence explanation>",
+  "signals_confirmed": ["<signal_name>", ...],
+  "risk_factors": ["<risk>", ...],
+  "likely_directional": <true|false>
+}}
+
+No markdown fences. No text outside the JSON. verdict must be exactly "pass" or "fail".
+"""

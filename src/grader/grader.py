@@ -90,13 +90,12 @@ class Grader:
         try:
             grade = parse_grade_response(llm_response.text)
             return grade, llm_response
-        except ParseError:
+        except ParseError as e:
             log.warning("parse_failed_retrying", attempt=1)
+            first_error = str(e)
 
         # Retry: ask the LLM to fix its output
-        retry_prompt = RETRY_PROMPT.format(
-            schema=json.dumps(GradeResponse.model_json_schema(), indent=2)
-        )
+        retry_prompt = RETRY_PROMPT.format(error=first_error)
         llm_response = await self._llm.complete(system, retry_prompt)
 
         try:
