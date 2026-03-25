@@ -9,11 +9,36 @@ from grader.models import GradeResponse
 
 log = structlog.get_logger()
 
+_PASS_SIGNALS = {"pass", "high conviction", "high_conviction", "strong conviction"}
+_FAIL_SIGNALS = {
+    "fail",
+    "low conviction",
+    "low_conviction",
+    "skip",
+    "insufficient",
+    "no conviction",
+    "neutral",
+    "hedge",
+}
+
 
 class ParseError(Exception):
     """Raised when the LLM response cannot be parsed after all attempts."""
 
     pass
+
+
+def normalize_verdict(raw: str) -> str:
+    lower = str(raw).strip().lower()
+    if lower in ("pass", "fail"):
+        return lower
+    for signal in _PASS_SIGNALS:
+        if signal in lower:
+            return "pass"
+    for signal in _FAIL_SIGNALS:
+        if signal in lower:
+            return "fail"
+    return "fail"
 
 
 def parse_grade_response(raw: str) -> GradeResponse:
@@ -28,7 +53,12 @@ def parse_grade_response(raw: str) -> GradeResponse:
     cleaned = _extract_json(raw)
 
     try:
-        return GradeResponse.model_validate_json(cleaned)
+        parsed = json.loads(cleaned)
+        if not isinstance(parsed, dict):
+            raise ValueError(f"Expected JSON object, got {type(parsed)}")
+        if "verdict" in parsed:
+            parsed["verdict"] = normalize_verdict(parsed["verdict"])
+        return GradeResponse.model_validate(parsed)
     except Exception as e:
         log.warning("parse_failed", raw=raw[:200], error=str(e))
         raise ParseError(f"Failed to parse LLM response: {e}") from e

@@ -120,16 +120,15 @@ def test_grade_response_score_validation_rejects_zero():
 
 
 def test_grade_response_verdict_validation_rejects_invalid():
-    """GradeResponse(verdict='maybe', ...) raises ValidationError."""
-    with pytest.raises(ValidationError) as exc_info:
-        GradeResponse(
-            score=50,
-            verdict="maybe",
-            rationale="Test",
-            signals_confirmed=[],
-            likely_directional=True,
-        )
-    assert "Verdict must be 'pass' or 'fail'" in str(exc_info.value)
+    """Free-form verdicts are normalized to pass/fail instead of raising."""
+    resp = GradeResponse(
+        score=50,
+        verdict="maybe",
+        rationale="Test",
+        signals_confirmed=[],
+        likely_directional=True,
+    )
+    assert resp.verdict == "fail"
 
 
 def test_grade_response_round_trips_through_json():

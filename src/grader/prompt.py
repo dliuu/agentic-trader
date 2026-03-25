@@ -55,7 +55,18 @@ USER_TEMPLATE = """Grade this unusual options trade:
 ## Scanner signals triggered
 {signals_block}
 
-Assess this trade. Is it directional or hedging? Does the context support the thesis?"""
+Assess this trade. Is it directional or hedging? Does the context support the thesis?
+
+CRITICAL FORMAT RULES:
+- "verdict" must be EXACTLY the string "pass" or "fail" (lowercase, no other values)
+- "score" must be an integer from 1 to 100
+- Respond with ONLY the JSON object, no markdown fences, no explanation outside the JSON
+
+Example valid response:
+{{"score": 72, "verdict": "pass", "rationale": "...", "signals_confirmed": ["premium_size", "otm_depth"]}}
+
+Example valid response:
+{{"score": 35, "verdict": "fail", "rationale": "...", "signals_confirmed": []}}"""
 
 
 def build_system_prompt() -> str:

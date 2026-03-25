@@ -64,9 +64,13 @@ class GradeResponse(BaseModel):
             raise ValueError(f"Score must be 1–100, got {v}")
         return v
 
-    @field_validator("verdict")
+    @field_validator("verdict", mode="before")
     @classmethod
     def verdict_valid(cls, v: str) -> str:
+        # Safety net: normalize any free-form Claude verdicts.
+        from grader.parser import normalize_verdict
+
+        v = normalize_verdict(v)
         if v not in ("pass", "fail"):
             raise ValueError(f"Verdict must be 'pass' or 'fail', got {v}")
         return v

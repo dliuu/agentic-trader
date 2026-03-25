@@ -2,7 +2,7 @@
 
 import pytest
 
-from grader.parser import ParseError, parse_grade_response
+from grader.parser import ParseError, normalize_verdict, parse_grade_response
 
 # Minimal valid GradeResponse JSON (all required fields)
 VALID_82 = '{"score": 82, "verdict": "pass", "rationale": "Strong signal.", "signals_confirmed": ["otm"], "likely_directional": true}'
@@ -50,8 +50,9 @@ def test_rejects_out_of_range_score():
 
 def test_rejects_invalid_verdict():
     raw = '{"score": 80, "verdict": "maybe", "rationale": "X", "signals_confirmed": [], "likely_directional": true}'
-    with pytest.raises(ParseError):
-        parse_grade_response(raw)
+    # Ambiguous verdicts normalize to "fail" (safe default) instead of hard failing the pipeline.
+    result = parse_grade_response(raw)
+    assert result.verdict == "fail"
 
 
 def test_rejects_garbage():
@@ -68,3 +69,20 @@ def test_rejects_score_zero():
     raw = '{"score": 0, "verdict": "fail", "rationale": "X", "signals_confirmed": [], "likely_directional": false}'
     with pytest.raises(ParseError):
         parse_grade_response(raw)
+
+
+@pytest.mark.parametrize(
+    "raw,expected",
+    [
+        ("pass", "pass"),
+        ("fail", "fail"),
+        ("High conviction directional bearish bet", "pass"),
+        ("LOW_CONVICTION", "fail"),
+        ("Low conviction - insufficient data", "fail"),
+        ("PASS", "pass"),
+        ("Pass", "pass"),
+        ("Likely hedge, not directional", "fail"),
+    ],
+)
+def test_verdict_normalization(raw, expected):
+    assert normalize_verdict(raw) == expected
