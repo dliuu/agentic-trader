@@ -8,7 +8,9 @@ from datetime import datetime, timezone
 import httpx
 
 from grader.context_builder import ContextBuilder
+from grader.context.sector_cache import get_sector_cache
 from grader.gate1 import run_gate1
+from grader.gate2 import run_gate2
 from grader.grader import Grader
 from grader.llm_client import LLMClient
 from grader.models import ScoredTrade
@@ -48,13 +50,26 @@ async def run_grader(
             if candidate is None:
                 break
 
-            passed_gate1, _ = await run_gate1(candidate)
+            passed_gate1, flow_score = await run_gate1(candidate)
             if not passed_gate1:
                 candidate_queue.task_done()
                 continue
 
+            # Gate 2: deterministic volatility + risk in parallel.
+            sector_cache = await get_sector_cache(http_client, config["uw_api_token"])
+            passed_gate2, _, _ = await run_gate2(
+                candidate=candidate,
+                flow_score=flow_score,
+                client=http_client,
+                api_token=config["uw_api_token"],
+                sector_cache=sector_cache,
+            )
+            if not passed_gate2:
+                candidate_queue.task_done()
+                continue
+
             if not grader_cfg.get("enabled", True):
-                # Pass-through mode: skip LLM grading (Gate 1 already applied)
+                # Pass-through mode: skip LLM grading (Gate 1 + Gate 2 already applied)
                 await scored_queue.put(
                     ScoredTrade(
                         candidate=candidate,

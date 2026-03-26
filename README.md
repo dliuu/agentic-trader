@@ -126,6 +126,11 @@ Press **`Ctrl+C`** in the terminal to interrupt the process.
 │  └─────────────────────────────────────┘  └───────────┬────────────┘ │
 │                                                       │              │
 │                                            ┌──────────▼───────────┐ │
+│                                            │  Gate 2 (Deterministic)│ │
+│                                            │  Vol + Risk → Pass/Reject│ │
+│                                            └──────────┬───────────┘ │
+│                                                       │              │
+│                                            ┌──────────▼───────────┐ │
 │                                            │   Agent B (Grader)    │ │
 │                                            │ Context → Claude → DB  │ │
 │                                            └──────────┬───────────┘ │
@@ -223,12 +228,12 @@ Before any LLM call, candidates pass through **Gate 1 (flow analyst)**:
 After Gate 1, Agent B (the grader) consumes the remaining candidates and runs them through:
 
 2. **Gate 2 scoring (deterministic)** — Runs the volatility analyst (4 UW endpoints: IV rank, vol stats, term structure, option chains) and a risk analyst in parallel, then checks the average of (flow + vol + risk) against `GATE_THRESHOLDS.gate2_avg_threshold`. The volatility analyst uses the Sector Benchmark Cache for “cheap vs market/sector” comparisons.
-2. **Context builder** — Fetches quote, greeks, news, insider/congressional trades from the Unusual Whales API (concurrent, with graceful degradation on partial failures).
-3. **Prompt assembly** — Renders system + user prompts from `GradingContext`, including the `GradeResponse` JSON schema.
-4. **LLM call** — Sends to Claude (default: `claude-sonnet-4-20250514`) with a 512-token limit.
-5. **Parse & validate** — Strips markdown fences, extracts JSON, validates with Pydantic. On parse failure, retries once.
-6. **Audit** — Writes every grading decision to the `grades` table in `data/trades.db`.
-7. **Routing** — If score ≥ `score_threshold` (default 70), emits a `ScoredTrade` to the scored queue; otherwise returns `None`.
+3. **Context builder** — Fetches quote, greeks, news, insider/congressional trades from the Unusual Whales API (concurrent, with graceful degradation on partial failures).
+4. **Prompt assembly** — Renders system + user prompts from `GradingContext`, including the `GradeResponse` JSON schema.
+5. **LLM call** — Sends to Claude (default: `claude-sonnet-4-20250514`) with a 512-token limit.
+6. **Parse & validate** — Strips markdown fences, extracts JSON, validates with Pydantic. On parse failure, retries once.
+7. **Audit** — Writes every grading decision to the `grades` table in `data/trades.db`.
+8. **Routing** — If score ≥ `score_threshold` (default 70), emits a `ScoredTrade` to the scored queue; otherwise returns `None`.
 
 With `grader.enabled: false` in config, the pipeline **still applies Gate 1**, then skips LLM calls and passes the surviving candidates through as `ScoredTrade` with `grade=None`.
 
@@ -429,15 +434,14 @@ whale-scanner/
 │       ├── grader.py             # Orchestrator (context → LLM → parse → log)
 │       ├── context/
 │       │   ├── __init__.py
-│       │   └── sector_cache.py   # Daily-refresh market/sector vol benchmarks (in-memory)
+│       │   ├── sector_cache.py   # Daily-refresh market/sector vol benchmarks (in-memory)
+│       │   └── vol_ctx.py        # Normalized volatility context builder for scoring
 │       ├── context_builder.py    # Enriches Candidate with quote, greeks, news, insider
 │       ├── agents/
 │       │   ├── __init__.py
 │       │   └── flow_analyst.py   # Deterministic Gate 1 scoring engine
 │       │   ├── volatility_analyst.py  # Deterministic Gate 2 volatility scorer (4 UW endpoints)
 │       │   └── risk_analyst.py        # Gate 2 risk scorer (placeholder/stub)
-│       ├── context/
-│       │   └── vol_ctx.py        # Normalized volatility context builder for scoring
 │       ├── prompt.py             # System + user prompt templates
 │       ├── llm_client.py         # Anthropic SDK wrapper
 │       ├── parser.py             # JSON extract + GradeResponse validation
@@ -457,6 +461,7 @@ whale-scanner/
 │   ├── test_llm_client.py
 │   ├── test_parser.py
 │   ├── test_flow_analyst.py
+│   ├── test_vol_analyst.py
 │   └── test_grader.py
 ├── scripts/
 │   ├── backfill.py
