@@ -3,7 +3,7 @@ import pytest
 import respx
 from datetime import datetime
 
-from src.grader.context.sector_cache import (
+from grader.context.sector_cache import (
     BENCHMARK_TICKERS,
     MARKET_PROXY_TICKER,
     SectorBenchmark,
@@ -196,7 +196,7 @@ def _mock_fail_ticker(ticker: str, status_code: int = 500):
 @respx.mock
 async def test_partial_failure_still_builds_cache():
     # Restrict to a tiny benchmark universe for the test.
-    from src.grader.context import sector_cache as sc
+    from grader.context import sector_cache as sc
 
     sc.BENCHMARK_TICKERS = {"Technology": ["AAPL", "MSFT", "NVDA"]}  # type: ignore[assignment]
     sc.MARKET_PROXY_TICKER = "SPY"  # type: ignore[assignment]
@@ -218,7 +218,7 @@ async def test_partial_failure_still_builds_cache():
 @pytest.mark.asyncio
 @respx.mock
 async def test_total_spy_failure_uses_defaults():
-    from src.grader.context import sector_cache as sc
+    from grader.context import sector_cache as sc
 
     sc.BENCHMARK_TICKERS = {"Energy": ["XOM", "CVX"]}  # type: ignore[assignment]
     sc.MARKET_PROXY_TICKER = "SPY"  # type: ignore[assignment]
@@ -239,7 +239,7 @@ async def test_total_spy_failure_uses_defaults():
 @pytest.mark.asyncio
 @respx.mock
 async def test_all_sectors_populated_when_api_succeeds():
-    from src.grader.context import sector_cache as sc
+    from grader.context import sector_cache as sc
 
     sc.BENCHMARK_TICKERS = {"Tech": ["AAPL", "MSFT"], "Energy": ["XOM", "CVX"]}  # type: ignore[assignment]
     sc.MARKET_PROXY_TICKER = "SPY"  # type: ignore[assignment]
@@ -260,7 +260,7 @@ async def test_all_sectors_populated_when_api_succeeds():
 @respx.mock
 async def test_get_sector_cache_caches_and_force_refresh():
     # Use a tiny universe and verify repeated calls return same object unless forced.
-    from src.grader.context import sector_cache as sc
+    from grader.context import sector_cache as sc
 
     sc.BENCHMARK_TICKERS = {"Tech": ["AAPL", "MSFT"]}  # type: ignore[assignment]
     sc.MARKET_PROXY_TICKER = "SPY"  # type: ignore[assignment]

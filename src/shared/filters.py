@@ -231,6 +231,7 @@ class GateThresholds:
     flow_analyst_min: int = 40
 
     # Gate 2: Average of (flow + vol + risk) minimum to proceed to LLM layer
+    gate2_avg_threshold: int = 45
     deterministic_avg_min: int = 45
 
     # Gate 3: Final synthesis score minimum to proceed to execution
@@ -241,34 +242,108 @@ GATE_THRESHOLDS = GateThresholds()
 
 
 # ──────────────────────────────────────────────
-# VOL ANALYST SCORING (for later implementation)
+# VOLATILITY ANALYST SCORING
 # ──────────────────────────────────────────────
 
 
 @dataclass(frozen=True)
 class VolScoringConfig:
-    """Tunable parameters for the volatility analyst."""
+    """All volatility analyst scoring thresholds and weights.
 
-    baseline: int = 50
-    iv_rank_low_threshold: int = 25
-    iv_rank_low_points: int = 15
-    iv_rank_below_median_threshold: int = 50
-    iv_rank_below_median_points: int = 5
-    iv_rank_high_threshold: int = 75
-    iv_rank_high_points: int = -15
-    iv_rank_extreme_threshold: int = 90
-    iv_rank_extreme_points: int = -10
-    iv_premium_high_threshold: float = 0.3
-    iv_premium_high_points: int = -10
-    iv_discount_points: int = 10
-    term_structure_inverted_points: int = 8
-    low_delta_threshold: float = 0.15
-    low_delta_points: int = 5
-    high_theta_decay_pct: float = 5.0
-    high_theta_decay_points: int = -10
+    Edit these values and restart to tune. All fields are named —
+    no magic constants in scoring logic.
+    """
 
+    # === Dimension weights (must sum to 1.0) ===
+    absolute_weight: float = 0.45
+    historical_weight: float = 0.30
+    market_context_weight: float = 0.25
 
-VOL_SCORING = VolScoringConfig()
+    # === Dimension 1: Absolute value ===
+
+    # IV Rank thresholds
+    iv_rank_low_threshold: float = 25.0  # Below this = cheap vol
+    iv_rank_low_bonus: int = 15
+    iv_rank_mid_low_threshold: float = 40.0  # Below this = moderately cheap
+    iv_rank_mid_low_bonus: int = 7
+    iv_rank_high_threshold: float = 75.0  # Above this = expensive vol
+    iv_rank_high_penalty: int = 15
+    iv_rank_mid_high_threshold: float = 60.0  # Above this = moderately expensive
+    iv_rank_mid_high_penalty: int = 7
+
+    # IV vs Realized Vol ratio
+    iv_rv_deep_discount_threshold: float = 0.80  # IV far below RV = great deal
+    iv_rv_deep_discount_bonus: int = 15
+    iv_rv_discount_threshold: float = 0.90  # IV below RV = good deal
+    iv_rv_discount_bonus: int = 10
+    iv_rv_mild_premium_threshold: float = 1.20  # Moderate premium
+    iv_rv_mild_premium_penalty: int = 6
+    iv_rv_premium_threshold: float = 1.40  # Heavy premium
+    iv_rv_premium_penalty: int = 12
+    iv_rv_extreme_premium_threshold: float = 1.60  # Extreme premium
+    iv_rv_extreme_premium_penalty: int = 18
+
+    # Theta decay (daily decay as fraction of premium)
+    theta_low_threshold: float = 0.02  # <2% daily decay = slow bleed, good
+    theta_low_bonus: int = 5
+    theta_high_threshold: float = 0.05  # >5% daily decay = fast bleed, bad
+    theta_high_penalty: int = 10
+    theta_extreme_threshold: float = 0.08  # >8% = ticket will be worthless soon
+    theta_extreme_penalty: int = 15
+
+    # Vega × IV rank interaction
+    # "High vega" defined as vega > vega_high_threshold (as % of premium)
+    vega_high_threshold: float = 0.10  # Vega > 10% of premium = vol-sensitive
+    vega_iv_synergy_bonus: int = 8  # High vega + low IV rank
+    vega_iv_conflict_penalty: int = 8  # High vega + high IV rank
+
+    # === Dimension 2: Relative to history ===
+
+    # IV percentile vs rank divergence
+    pctl_rank_divergence_threshold: float = 15.0  # |percentile - rank| > 15
+    pctl_below_rank_bonus: int = 6  # percentile << rank = cheap vs distribution
+    pctl_above_rank_penalty: int = 4  # percentile >> rank = expensive vs distribution
+
+    # Term structure shape
+    term_inversion_threshold: float = -0.05  # slope < -5% = inverted
+    term_inversion_near_expiry_bonus: int = 10  # Inverted + candidate in near term
+    term_inversion_far_expiry_bonus: int = 4  # Inverted but candidate is far-dated
+    term_contango_threshold: float = 0.15  # slope > 15% = steep contango
+    term_contango_near_penalty: int = 8  # Steep contango + near-term = overpaying
+    term_contango_far_bonus: int = 3  # Steep contango but far-dated = ok
+
+    # Near-term DTE threshold for term structure scoring
+    near_term_dte_threshold: int = 30  # <= 30 DTE = "near term"
+
+    # Realized vol regime shift (20d vs 60d)
+    rv_expansion_threshold: float = 1.20  # RV20/RV60 > 1.2 = vol expanding
+    rv_expansion_bonus: int = 8
+    rv_compression_threshold: float = 0.80  # RV20/RV60 < 0.8 = vol compressing
+    rv_compression_penalty: int = 6
+
+    # === Dimension 3: Market context ===
+
+    # Ticker IV rank vs market IV rank (SPY proxy) divergence
+    market_divergence_threshold: float = 20.0  # |ticker_rank - market_rank| > 20
+    ticker_cheap_market_expensive_bonus: int = 10  # ticker low + market high
+    ticker_expensive_market_cheap_penalty: int = 10
+
+    # IV/RV ratio vs sector median
+    sector_below_median_bonus: int = 8  # Ticker IV/RV < sector median
+    sector_above_p75_penalty: int = 8  # Ticker IV/RV > sector 75th percentile
+
+    # Delta-adjusted moneyness
+    delta_sweet_low: float = 0.20  # Reasonable probability range
+    delta_sweet_high: float = 0.50
+    delta_sweet_bonus: int = 5
+    delta_deep_otm_threshold: float = 0.10  # Lottery ticket
+    delta_deep_otm_penalty: int = 8
+    delta_deep_itm_threshold: float = 0.80  # Paying mostly intrinsic value
+    delta_deep_itm_penalty: int = 4
+
+    # === Score clamping ===
+    min_score: int = 5
+    max_score: int = 95
 
 
 # ──────────────────────────────────────────────

@@ -4,9 +4,10 @@ A two-agent pipeline for unusual options flow:
 
 - **Agent A (Scanner)** — Deterministic rule engine that scans for unusual options flow during US market hours. Polls the [Unusual Whales](https://unusualwhales.com) API, applies configurable filters, scores candidates by multi-signal confluence, and pushes them to the grader.
 - **Gate 1 (Flow Analyst)** — Deterministic post-scanner filter (no LLM, no external API calls). Scores each candidate 1–100 from the in-memory `Candidate` object only, logs every decision to SQLite, and discards candidates below threshold before any LLM tokens are spent.
+- **Gate 2 (Volatility Analyst + Risk Analyst)** — Deterministic “is the buyer getting a good deal?” layer. The **Volatility Analyst** fetches 4 UW volatility/chain endpoints per candidate (no LLM), scores 1–100, and uses the Sector Benchmark Cache for market/sector context. Gate 2 passes when the average of (flow + vol + risk) meets the configured threshold.
 - **Agent B (Grader)** — LLM-powered grading layer (Claude) that scores each candidate 1–100, validates conviction, and emits passing trades to a scored queue.
 
-**Key features:** Confluence enrichment (dark pool + market tide), `--force` to bypass market hours, `--max-cycles` for limited runs, dual logging (terminal + `scanner.json.log`), grader pass-through mode (`enabled: false`), and audit logging to SQLite.
+**Key features:** Confluence enrichment (dark pool + market tide), deterministic multi-gate filtering (Gate 1 + Gate 2) before any LLM spend, `--force` to bypass market hours, `--max-cycles` for limited runs, dual logging (terminal + `scanner.json.log`), grader pass-through mode (`enabled: false`), and audit logging to SQLite.
 
 ### Quick run (full pipeline)
 
@@ -144,7 +145,8 @@ At a high level, the pipeline is:
 1. **Scanner (Agent A)** polls the Unusual Whales API for raw flow and confluence signals, deduplicates, applies the rule engine, and emits `Candidate` objects.
 2. **Sector Benchmark Cache** (daily-refresh, in-memory) fetches market/sector volatility benchmarks used for “cheap vs market/sector” context. This cache is designed to be warmed once per trading day and reused across all candidates graded that day.
 3. **Filter agent (Gate 1 Flow Analyst)** deterministically scores each `Candidate` from in-memory fields only (no LLM, no external API calls) and rejects low-quality candidates before any token spend.
-4. **Grader (Agent B)** (when enabled) builds enriched context via UW endpoints, calls the LLM, parses/validates output, audits to SQLite, and emits passing `ScoredTrade` results.
+4. **Gate 2 (Volatility Analyst + Risk Analyst)** runs in parallel and determines whether the buyer is paying fair implied volatility relative to the ticker’s own history, sector peers, and the broader market. Gate 2 is deterministic and designed to be low-latency.
+5. **Grader (Agent B)** (when enabled) builds enriched context via UW endpoints, calls the LLM, parses/validates output, audits to SQLite, and emits passing `ScoredTrade` results.
 
 ---
 
@@ -220,6 +222,7 @@ Before any LLM call, candidates pass through **Gate 1 (flow analyst)**:
 
 After Gate 1, Agent B (the grader) consumes the remaining candidates and runs them through:
 
+2. **Gate 2 scoring (deterministic)** — Runs the volatility analyst (4 UW endpoints: IV rank, vol stats, term structure, option chains) and a risk analyst in parallel, then checks the average of (flow + vol + risk) against `GATE_THRESHOLDS.gate2_avg_threshold`. The volatility analyst uses the Sector Benchmark Cache for “cheap vs market/sector” comparisons.
 2. **Context builder** — Fetches quote, greeks, news, insider/congressional trades from the Unusual Whales API (concurrent, with graceful degradation on partial failures).
 3. **Prompt assembly** — Renders system + user prompts from `GradingContext`, including the `GradeResponse` JSON schema.
 4. **LLM call** — Sends to Claude (default: `claude-sonnet-4-20250514`) with a 512-token limit.
@@ -234,6 +237,23 @@ With `grader.enabled: false` in config, the pipeline **still applies Gate 1**, t
 ## Running on Live Market Data
 
 Ensure the venv is activated and API keys are set (see [Getting Started](#getting-started)).
+
+### End-to-end: see volatility scoring results
+
+Run a short forced pipeline, then inspect the structured logs for per-candidate volatility scoring:
+
+```bash
+# Run end-to-end for a few cycles (scanner → Gate 1 → Gate 2 → grader)
+python -m scanner.run_pipeline --force --max-cycles 3
+
+# See volatility analyst score summaries (structlog event: vol_analyst.scored)
+jq -c 'select(.event == "vol_analyst.scored") | {ticker, score, abs_score, hist_score, mkt_score, signal_count}' scanner.json.log
+```
+
+Notes:
+
+- Gate 2 uses the **Sector Benchmark Cache** (SPY + per-sector benchmark tickers). The cache auto-refreshes when stale.
+- If the volatility analyst can’t fetch required UW data for a candidate, it returns a neutral `SubScore(score=50, skipped=True)` with a skip reason, and the pipeline continues.
 
 ### Command-Line Options
 
@@ -405,6 +425,7 @@ whale-scanner/
 │       ├── __init__.py
 │       ├── main.py               # Consumer loop: candidate_queue → scored_queue
 │       ├── gate1.py              # Gate 1: deterministic flow analyst + SQLite logging
+│       ├── gate2.py              # Gate 2: deterministic volatility + risk (parallel) + threshold
 │       ├── grader.py             # Orchestrator (context → LLM → parse → log)
 │       ├── context/
 │       │   ├── __init__.py
@@ -413,6 +434,10 @@ whale-scanner/
 │       ├── agents/
 │       │   ├── __init__.py
 │       │   └── flow_analyst.py   # Deterministic Gate 1 scoring engine
+│       │   ├── volatility_analyst.py  # Deterministic Gate 2 volatility scorer (4 UW endpoints)
+│       │   └── risk_analyst.py        # Gate 2 risk scorer (placeholder/stub)
+│       ├── context/
+│       │   └── vol_ctx.py        # Normalized volatility context builder for scoring
 │       ├── prompt.py             # System + user prompt templates
 │       ├── llm_client.py         # Anthropic SDK wrapper
 │       ├── parser.py             # JSON extract + GradeResponse validation
@@ -657,6 +682,7 @@ pytest tests/test_grader.py tests/test_grader_models.py tests/test_context_build
 Ensure the venv is activated and the project is installed (`pip install -e ".[dev,grader]"`).
 
 Sector benchmark cache tests live in `tests/test_sector_cache.py`.
+Volatility analyst tests live in `tests/test_vol_analyst.py`.
 
 ### Capturing test fixtures
 
