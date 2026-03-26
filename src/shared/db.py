@@ -45,6 +45,15 @@ async def _ensure_tables(db: aiosqlite.Connection) -> None:
             filled_at TEXT,
             FOREIGN KEY (grade_id) REFERENCES grades(id)
         );
+        CREATE TABLE IF NOT EXISTS flow_scores (
+            candidate_id TEXT PRIMARY KEY,
+            score INTEGER NOT NULL,
+            rationale TEXT,
+            signals JSON,
+            skipped INTEGER DEFAULT 0,
+            skip_reason TEXT,
+            scored_at TEXT NOT NULL
+        );
         """
     )
     await db.commit()

@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 import httpx
 
 from grader.context_builder import ContextBuilder
+from grader.gate1 import run_gate1
 from grader.grader import Grader
 from grader.llm_client import LLMClient
 from grader.models import ScoredTrade
@@ -45,8 +46,13 @@ async def run_grader(
             if candidate is None:
                 break
 
+            passed_gate1, _ = await run_gate1(candidate)
+            if not passed_gate1:
+                candidate_queue.task_done()
+                continue
+
             if not grader_cfg.get("enabled", True):
-                # Pass-through mode: skip grading
+                # Pass-through mode: skip LLM grading (Gate 1 already applied)
                 await scored_queue.put(
                     ScoredTrade(
                         candidate=candidate,
