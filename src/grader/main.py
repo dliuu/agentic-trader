@@ -26,19 +26,21 @@ async def run_grader(
 
     async with httpx.AsyncClient() as http_client:
         ctx_builder = ContextBuilder(http_client, config["uw_api_token"])
-        llm = LLMClient(
-            api_key=config["anthropic_api_key"],
-            model=grader_cfg["model"],
-            max_tokens=grader_cfg["max_tokens"],
-            timeout=grader_cfg["timeout_seconds"],
-        )
-
-        grader = Grader(
-            context_builder=ctx_builder,
-            llm_client=llm,
-            score_threshold=grader_cfg["score_threshold"],
-            max_parse_retries=grader_cfg["max_parse_retries"],
-        )
+        grader: Grader | None = None
+        llm: LLMClient | None = None
+        if grader_cfg.get("enabled", True):
+            llm = LLMClient(
+                api_key=config["anthropic_api_key"],
+                model=grader_cfg["model"],
+                max_tokens=grader_cfg["max_tokens"],
+                timeout=grader_cfg["timeout_seconds"],
+            )
+            grader = Grader(
+                context_builder=ctx_builder,
+                llm_client=llm,
+                score_threshold=grader_cfg["score_threshold"],
+                max_parse_retries=grader_cfg["max_parse_retries"],
+            )
 
         while True:
             candidate = await candidate_queue.get()
@@ -67,8 +69,15 @@ async def run_grader(
                 candidate_queue.task_done()
                 continue
 
+            if grader is None:
+                candidate_queue.task_done()
+                continue
+
             result = await grader.grade(candidate)
             if result is not None:
                 await scored_queue.put(result)
 
             candidate_queue.task_done()
+
+        if llm is not None:
+            await llm.close()

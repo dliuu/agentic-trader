@@ -3,6 +3,7 @@
 A two-agent pipeline for unusual options flow:
 
 - **Agent A (Scanner)** — Deterministic rule engine that scans for unusual options flow during US market hours. Polls the [Unusual Whales](https://unusualwhales.com) API, applies configurable filters, scores candidates by multi-signal confluence, and pushes them to the grader.
+- **Gate 1 (Flow Analyst)** — Deterministic post-scanner filter (no LLM, no external API calls). Scores each candidate 1–100 from the in-memory `Candidate` object only, logs every decision to SQLite, and discards candidates below threshold before any LLM tokens are spent.
 - **Agent B (Grader)** — LLM-powered grading layer (Claude) that scores each candidate 1–100, validates conviction, and emits passing trades to a scored queue.
 
 **Key features:** Confluence enrichment (dark pool + market tide), `--force` to bypass market hours, `--max-cycles` for limited runs, dual logging (terminal + `scanner.json.log`), grader pass-through mode (`enabled: false`), and audit logging to SQLite.
@@ -22,7 +23,9 @@ See [Getting Started](#getting-started) for full venv setup and run instructions
 
 - [Getting Started](#getting-started)
 - [Architecture Overview](#architecture-overview)
+- [End-to-End Flow Summary](#end-to-end-flow-summary)
 - [How the Scanner Works](#how-the-scanner-works)
+- [Sector Benchmark Cache (Market/Sector Vol Benchmarks)](#sector-benchmark-cache-marketsector-vol-benchmarks)
 - [How the Grader Works](#how-the-grader-works)
 - [Running on Live Market Data](#running-on-live-market-data)
 - [Benchmarking Results](#benchmarking-results)
@@ -114,19 +117,34 @@ Press **`Ctrl+C`** in the terminal to interrupt the process.
 │                     Full Pipeline (run_pipeline)                      │
 │                                                                       │
 │  ┌─────────────────────────────────────┐  ┌────────────────────────┐ │
-│  │         Agent A (Scanner)            │  │     Agent B (Grader)    │ │
+│  │         Agent A (Scanner)            │  │ Gate 1 (Flow Analyst)   │ │
 │  │                                      │  │                         │ │
 │  │  Market Clock → UW API → Dedup       │  │  Candidate Queue        │ │
-│  │       → Rule Engine → Confluence     │──▶│       → Context Builder │ │
-│  │       → SQLite + Queue               │  │       → Claude (LLM)    │ │
-│  │                                      │  │       → Parser → Score  │ │
+│  │       → Rule Engine → Confluence     │──▶│       → Score + Log     │ │
+│  │       → SQLite + Queue               │  │       → Pass/Reject     │ │
 │  └─────────────────────────────────────┘  └───────────┬────────────┘ │
+│                                                       │              │
+│                                            ┌──────────▼───────────┐ │
+│                                            │   Agent B (Grader)    │ │
+│                                            │ Context → Claude → DB  │ │
+│                                            └──────────┬───────────┘ │
 │                                                       │              │
 │                                            Scored Queue → (Agent C)   │
 └─────────────────────────────────────────────────────────────────────┘
 ```
 
-The scanner runs as an async producer: every cycle it fetches flow alerts, dark pool prints, and market tide from the Unusual Whales API, deduplicates, runs the rule engine, enriches with confluence data, persists to SQLite, and pushes candidates into a shared queue. The grader runs concurrently as a consumer: it pulls candidates, enriches them with quote/greeks/news/insider data via the context builder, sends them to Claude for scoring, parses the JSON response, and pushes passing trades (score ≥ threshold) to the scored queue. Both agents share `src/shared/` (models, config, db).
+The scanner runs as an async producer: every cycle it fetches flow alerts, dark pool prints, and market tide from the Unusual Whales API, deduplicates, runs the rule engine, enriches with confluence data, persists to SQLite, and pushes candidates into a shared queue. The flow analyst runs as a deterministic Gate 1 consumer: it converts the scanner `Candidate` into a normalized `FlowCandidate`, applies a deterministic scoring algorithm (no LLM, no external APIs), logs every decision to SQLite, and rejects candidates below threshold. Only then does the LLM grader run (when enabled) to spend tokens on the highest-quality subset. Shared code lives in `src/shared/` (models, config, db, filters).
+
+---
+
+## End-to-End Flow Summary
+
+At a high level, the pipeline is:
+
+1. **Scanner (Agent A)** polls the Unusual Whales API for raw flow and confluence signals, deduplicates, applies the rule engine, and emits `Candidate` objects.
+2. **Sector Benchmark Cache** (daily-refresh, in-memory) fetches market/sector volatility benchmarks used for “cheap vs market/sector” context. This cache is designed to be warmed once per trading day and reused across all candidates graded that day.
+3. **Filter agent (Gate 1 Flow Analyst)** deterministically scores each `Candidate` from in-memory fields only (no LLM, no external API calls) and rejects low-quality candidates before any token spend.
+4. **Grader (Agent B)** (when enabled) builds enriched context via UW endpoints, calls the LLM, parses/validates output, audits to SQLite, and emits passing `ScoredTrade` results.
 
 ---
 
@@ -148,18 +166,68 @@ Each polling cycle (default: every 30 seconds during market hours) follows this 
 
 ---
 
+## Sector Benchmark Cache (Market/Sector Vol Benchmarks)
+
+The **Sector Benchmark Cache** is a lightweight, **in-memory** data layer that fetches a small set of liquid benchmark tickers once per trading day (or on first use), computes per-sector IV/RV ratio percentiles, and exposes simple lookups for downstream scoring agents.
+
+- **What it’s for**: letting an analyst answer “Is this option cheap vs the market and vs its sector?” by comparing a candidate’s implied/realized vol relationship to sector/market baselines.
+- **What it is not**: not a database; not persisted across process restarts; intentionally small benchmark universe (~39 tickers including SPY).
+- **Refresh policy**: cache is considered stale after **8 hours** and will auto-refresh when requested.
+
+### Where it lives
+
+- `src/grader/context/sector_cache.py`
+
+### Public API
+
+- `refresh_sector_cache(client, api_token) -> SectorBenchmarkCache`: fetch everything and compute benchmarks.
+- `get_sector_cache(client, api_token, force_refresh=False) -> SectorBenchmarkCache`: cached accessor (refreshes if missing/stale/forced).
+- `get_cached_benchmarks() -> SectorBenchmarkCache | None`: sync accessor (may be `None` before first refresh).
+
+### Lookups
+
+- `cache.get_sector(sector_name)`: exact match
+- `cache.get_sector_fuzzy(sector_name)`: exact → case-insensitive → substring → fallback to `_all_sectors`
+
+### Minimal usage example
+
+```python
+import httpx
+
+from grader.context.sector_cache import get_sector_cache
+
+
+async def example(api_token: str) -> None:
+    async with httpx.AsyncClient() as client:
+        cache = await get_sector_cache(client, api_token)
+        tech = cache.get_sector_fuzzy("technology")
+        market_rank = cache.market_iv_rank
+```
+
+### Notes on robustness
+
+- Field extraction helpers handle **multiple possible UW response field names** and emit `structlog` warnings when using fallback keys.
+- Partial per-ticker failures are **logged and excluded** from benchmarks.
+- If the market proxy (`SPY`) fetch fails, market values default to neutral: `iv_rank=50.0`, `iv=0.20`, `ratio=1.0`.
+
+---
+
 ## How the Grader Works
 
-Agent B (the grader) consumes candidates from the shared queue and runs them through:
+Before any LLM call, candidates pass through **Gate 1 (flow analyst)**:
 
-1. **Context builder** — Fetches quote, greeks, news, insider/congressional trades from the Unusual Whales API (concurrent, with graceful degradation on partial failures).
-2. **Prompt assembly** — Renders system + user prompts from `GradingContext`, including the `GradeResponse` JSON schema.
-3. **LLM call** — Sends to Claude (default: `claude-sonnet-4-20250514`) with a 512-token limit.
-4. **Parse & validate** — Strips markdown fences, extracts JSON, validates with Pydantic. On parse failure, retries once.
-5. **Audit** — Writes every grading decision to the `grades` table in `data/trades.db`.
-6. **Routing** — If score ≥ `score_threshold` (default 70), emits a `ScoredTrade` to the scored queue; otherwise returns `None`.
+1. **Gate 1 scoring (deterministic)** — Converts the scanner `Candidate` into `FlowCandidate` (`grader.agents.flow_analyst.candidate_to_flow`), checks ticker exclusion lists (ETFs/index/VIX products), scores trade mechanics 1–100 using constants in `shared.filters`, and logs every decision to the `flow_scores` table in `data/trades.db`. Candidates below `GATE_THRESHOLDS.flow_analyst_min` are discarded.
 
-With `grader.enabled: false` in config, the grader skips LLM calls and passes candidates through as `ScoredTrade` with `grade=None`.
+After Gate 1, Agent B (the grader) consumes the remaining candidates and runs them through:
+
+2. **Context builder** — Fetches quote, greeks, news, insider/congressional trades from the Unusual Whales API (concurrent, with graceful degradation on partial failures).
+3. **Prompt assembly** — Renders system + user prompts from `GradingContext`, including the `GradeResponse` JSON schema.
+4. **LLM call** — Sends to Claude (default: `claude-sonnet-4-20250514`) with a 512-token limit.
+5. **Parse & validate** — Strips markdown fences, extracts JSON, validates with Pydantic. On parse failure, retries once.
+6. **Audit** — Writes every grading decision to the `grades` table in `data/trades.db`.
+7. **Routing** — If score ≥ `score_threshold` (default 70), emits a `ScoredTrade` to the scored queue; otherwise returns `None`.
+
+With `grader.enabled: false` in config, the pipeline **still applies Gate 1**, then skips LLM calls and passes the surviving candidates through as `ScoredTrade` with `grade=None`.
 
 ---
 
@@ -193,7 +261,7 @@ python -m scanner.main
 | Output | Location | Description |
 |--------|----------|-------------|
 | Scanner DB | `data/scanner.db` | Candidates, raw alerts, scan cycles |
-| Grader DB | `data/trades.db` | Grades table (score, verdict, rationale, token counts) |
+| Grader DB | `data/trades.db` | Gate 1 flow scores (`flow_scores`) + LLM grades (`grades`) |
 | Log file | `scanner.json.log` | Structured JSON logs (terminal + file) |
 | Heartbeat | `data/heartbeat.txt` | UTC timestamp updated every cycle |
 
@@ -304,8 +372,9 @@ whale-scanner/
 ├── src/
 │   ├── shared/                   # Cross-agent code
 │   │   ├── __init__.py
-│   │   ├── models.py             # Candidate, SignalMatch
-│   │   ├── db.py                 # SQLite connection + grades/scans/executions tables
+│   │   ├── filters.py            # Gate thresholds, scoring weights, ticker exclusions
+│   │   ├── models.py             # Candidate, SignalMatch, FlowCandidate, SubScore
+│   │   ├── db.py                 # SQLite connection + grades/scans/executions/flow_scores tables
 │   │   └── config.py             # YAML loader + env injection
 │   ├── scanner/
 │   │   ├── __init__.py
@@ -335,8 +404,15 @@ whale-scanner/
 │   └── grader/
 │       ├── __init__.py
 │       ├── main.py               # Consumer loop: candidate_queue → scored_queue
+│       ├── gate1.py              # Gate 1: deterministic flow analyst + SQLite logging
 │       ├── grader.py             # Orchestrator (context → LLM → parse → log)
+│       ├── context/
+│       │   ├── __init__.py
+│       │   └── sector_cache.py   # Daily-refresh market/sector vol benchmarks (in-memory)
 │       ├── context_builder.py    # Enriches Candidate with quote, greeks, news, insider
+│       ├── agents/
+│       │   ├── __init__.py
+│       │   └── flow_analyst.py   # Deterministic Gate 1 scoring engine
 │       ├── prompt.py             # System + user prompt templates
 │       ├── llm_client.py         # Anthropic SDK wrapper
 │       ├── parser.py             # JSON extract + GradeResponse validation
@@ -355,6 +431,7 @@ whale-scanner/
 │   ├── test_prompt.py
 │   ├── test_llm_client.py
 │   ├── test_parser.py
+│   ├── test_flow_analyst.py
 │   └── test_grader.py
 ├── scripts/
 │   ├── backfill.py
@@ -469,13 +546,16 @@ The `DedupCache` prevents the same trade from being flagged across consecutive p
 
 **Scanner DB** (`data/scanner.db`): `ScannerDB` stores candidates, raw alerts, and scan cycles.
 
-**Grader DB** (`data/trades.db`): `shared.db.get_db()` creates the `grades` table. Every grading call writes a row (candidate_id, score, verdict, rationale, model, token counts, latency).
+**Grader DB** (`data/trades.db`): `shared.db.get_db()` creates:
+
+- `flow_scores` — every Gate 1 decision (candidate_id, score, skipped/skip_reason, rationale, signals, scored_at)
+- `grades` — every LLM grading decision (candidate_id, score, verdict, rationale, model, token counts, latency)
 
 ---
 
 ## Configuration Reference
 
-All tunable parameters live in `config/rules.yaml`. No magic numbers in code.
+Scanner rule thresholds live in `config/rules.yaml`. Deterministic grading tunables (ticker exclusions, Gate 1 thresholds, and scoring weights) live in `src/shared/filters.py` as the single source of truth for the grading pipeline.
 
 ### Polling
 
@@ -575,6 +655,8 @@ pytest tests/test_grader.py tests/test_grader_models.py tests/test_context_build
 ```
 
 Ensure the venv is activated and the project is installed (`pip install -e ".[dev,grader]"`).
+
+Sector benchmark cache tests live in `tests/test_sector_cache.py`.
 
 ### Capturing test fixtures
 

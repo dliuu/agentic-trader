@@ -3,10 +3,22 @@
 import time
 from dataclasses import dataclass
 
-import anthropic
 import structlog
 
 log = structlog.get_logger()
+
+try:
+    import anthropic  # type: ignore
+except Exception:  # pragma: no cover - exercised in environments without optional deps
+    class _AnthropicStub:
+        class AsyncAnthropic:  # noqa: D401 - minimal stub for monkeypatching
+            def __init__(self, *args, **kwargs):
+                raise ModuleNotFoundError(
+                    "Optional dependency 'anthropic' is not installed. "
+                    "Install with `pip install -e '.[grader]'` (or `pip install anthropic`)."
+                )
+
+    anthropic = _AnthropicStub()  # type: ignore[assignment]
 
 
 @dataclass
