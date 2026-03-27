@@ -5,18 +5,27 @@ A multi-gate pipeline for unusual options flow:
 - **Agent A (Scanner)** — Deterministic rule engine that scans for unusual options flow during US market hours. Polls the [Unusual Whales](https://unusualwhales.com) API, applies configurable filters, scores candidates by multi-signal confluence, and pushes them to the grader.
 - **Gate 1 (Flow Analyst)** — Deterministic post-scanner filter (no LLM, no external API calls). Scores each candidate 1–100 from the in-memory `Candidate` object only, logs every decision to SQLite, and discards candidates below threshold before any LLM tokens are spent.
 - **Gate 2 (Volatility Analyst + Risk Analyst)** — Deterministic “is the buyer getting a good deal?” layer. The **Volatility Analyst** fetches 4 UW volatility/chain endpoints per candidate (no LLM), and the **Risk Analyst** scores structural conviction from buyer risk accepted (premium, DTE, spread, OTM distance, move ratio, liquidity, earnings proximity). Gate 2 passes when the average of (flow + vol + risk) meets the configured threshold.
-- **Gate 3 (Sentiment + Insider + Sector + LLM layer)** — Runs **Sentiment Analyst**, **Insider Tracker**, and a deterministic **Sector Analyst** in parallel (each can emit a `SubScore`), then runs the main LLM grader to score conviction and emit passing trades. The Insider Tracker scores whether insiders and congressional holders align with the flow (UW + Finnhub; see [Insider Tracker (Gate 3)](#insider-tracker-gate-3)). The Sector Analyst scores macro/sector support from UW sector tide, market tide, economic calendar, and optional FDA calendar signals for healthcare names (see [Sector Analyst (Gate 3)](#sector-analyst-gate-3)).
+- **Gate 3 (Specialists + synthesis)** — Runs **Sentiment Analyst**, **Insider Tracker**, and a deterministic **Sector Analyst** in parallel (each emits a `SubScore`). Those scores are merged with Gate 1–2 sub-scores into a **deterministic aggregator** (weighted average, disagreement, six conflict detectors). A final **Synthesis** step makes **one** Claude call to produce the 1–100 score, applies deterministic caps, merges position sizing with the risk analyst, and emits a passing `ScoredTrade` if the score meets the threshold. See [Synthesis layer (Gate 3)](#synthesis-layer-gate-3) and the specialist sections below.
 
-**Key features:** Confluence enrichment (dark pool + market tide), deterministic multi-gate filtering (Gate 1 + Gate 2) before any LLM spend, `--force` to bypass market hours, `--max-cycles` for limited runs, dual logging (terminal + `scanner.json.log`), grader pass-through mode (`enabled: false`), and audit logging to SQLite.
+**Key features:** Confluence enrichment (dark pool + market tide), deterministic Gates 1–2 before most LLM spend, Gate 3 uses three specialist calls plus one synthesis call (not the legacy single-shot context grader in production), `--force` to bypass market hours, `--max-cycles` for limited runs, dual logging (terminal + `scanner.json.log`), grader pass-through mode (`grader.enabled: false`), and audit logging to SQLite (`flow_scores` + `grades`).
 
 ### Quick run (full pipeline)
 
 ```bash
-source .venv/bin/activate
+cd whale-scanner
+source .venv/bin/activate          # or: .venv\Scripts\activate on Windows
+pip install -e ".[dev,grader]"     # once per venv
+
+# Option A — module (recommended in docs)
 python -m scanner.run_pipeline --force --max-cycles 3
+
+# Option B — console script (same entrypoint as run_pipeline)
+whale-pipeline --force --max-cycles 3
 ```
 
-See [Getting Started](#getting-started) for full venv setup and run instructions.
+Scanner-only (no grader): `python -m scanner.main --force --max-cycles 3` or `whale-scanner --force --max-cycles 3`.
+
+See [Getting Started](#getting-started) for venv setup, `.env`, and all run modes.
 
 ---
 
@@ -28,6 +37,7 @@ See [Getting Started](#getting-started) for full venv setup and run instructions
 - [How the Scanner Works](#how-the-scanner-works)
 - [Sector Benchmark Cache (Market/Sector Vol Benchmarks)](#sector-benchmark-cache-marketsector-vol-benchmarks)
 - [How the Grader Works](#how-the-grader-works)
+- [Synthesis layer (Gate 3)](#synthesis-layer-gate-3)
 - [Sentiment Analyst (Gate 3)](#sentiment-analyst-gate-3)
 - [Insider Tracker (Gate 3)](#insider-tracker-gate-3)
 - [Sector Analyst (Gate 3)](#sector-analyst-gate-3)
@@ -98,16 +108,27 @@ FINNHUB_API_KEY=your_finnhub_api_key_here
 
 ### Step 4: Run the pipeline
 
+From the repo root, with the venv activated:
+
 ```bash
 # Full pipeline (scanner + grader) — test run, 3 cycles
 python -m scanner.run_pipeline --force --max-cycles 3
+# equivalent:
+whale-pipeline --force --max-cycles 3
 
-# Full pipeline — live during market hours (runs indefinitely)
+# Full pipeline — live during market hours (runs until Ctrl+C)
 python -m scanner.run_pipeline
+whale-pipeline
 
-# Scanner only (no grading)
+# Scanner only (no Gate 2/3, no grading)
 python -m scanner.main --force --max-cycles 3
+whale-scanner --force --max-cycles 3
 ```
+
+| Entry | What it runs |
+|-------|----------------|
+| `scanner.run_pipeline` / `whale-pipeline` | `run_scanner` ∥ `run_grader` (full queue pipeline) |
+| `scanner.main` / `whale-scanner` | Scanner loop only (no consumer grading) |
 
 ### Stop a running pipeline
 
@@ -134,16 +155,27 @@ Press **`Ctrl+C`** in the terminal to interrupt the process.
 │                                            │  Vol + Risk → Pass/Reject│ │
 │                                            └──────────┬───────────┘ │
 │                                                       │              │
-│                                            ┌──────────▼───────────┐ │
-│                                            │   Agent B (Grader)    │ │
-│                                            │ Context → Claude → DB  │ │
-│                                            └──────────┬───────────┘ │
-│                                                       │              │
-│                                            Scored Queue → (Agent C)   │
-└─────────────────────────────────────────────────────────────────────┘
+│                                            ┌──────────▼──────────────┐ │
+│                                            │ Gate 3 specialists     │ │
+│                                            │ Sentiment ∥ Insider ∥   │ │
+│                                            │ Sector (→ SubScores)    │ │
+│                                            └──────────┬──────────────┘ │
+│                                                       │                │
+│                                            ┌──────────▼──────────────┐ │
+│                                            │ Aggregator (deterministic)│ │
+│                                            │ weights · stdev · conflicts│ │
+│                                            └──────────┬──────────────┘ │
+│                                                       │                │
+│                                            ┌──────────▼──────────────┐ │
+│                                            │ Synthesis (1× Claude)   │ │
+│                                            │ caps · verdict · risk   │ │
+│                                            └──────────┬──────────────┘ │
+│                                                       │                │
+│                                            Scored Queue → (Agent C)     │
+└───────────────────────────────────────────────────────────────────────┘
 ```
 
-The scanner runs as an async producer: every cycle it fetches flow alerts, dark pool prints, and market tide from the Unusual Whales API, deduplicates, runs the rule engine, enriches with confluence data, persists to SQLite, and pushes candidates into a shared queue. The flow analyst runs as a deterministic Gate 1 consumer: it converts the scanner `Candidate` into a normalized `FlowCandidate`, applies a deterministic scoring algorithm (no LLM, no external APIs), logs every decision to SQLite, and rejects candidates below threshold. Only then does the LLM grader run (when enabled) to spend tokens on the highest-quality subset. Shared code lives in `src/shared/` (models, config, db, filters).
+The scanner runs as an async producer: every cycle it fetches flow alerts, dark pool prints, and market tide from the Unusual Whales API, deduplicates, runs the rule engine, enriches with confluence data, persists to SQLite, and pushes candidates into a shared queue. The grader consumer runs Gates 1–3: deterministic flow, then vol + risk, then parallel specialists, deterministic aggregation, and a single synthesis LLM call (when grading is enabled). Shared code lives in `src/shared/` (models, config, db, filters).
 
 ---
 
@@ -155,8 +187,9 @@ At a high level, the pipeline is:
 2. **Sector Benchmark Cache** (daily-refresh, in-memory) fetches market/sector volatility benchmarks used for "cheap vs market/sector" context. This cache is designed to be warmed once per trading day and reused across all candidates graded that day.
 3. **Filter agent (Gate 1 Flow Analyst)** deterministically scores each `Candidate` from in-memory fields only (no LLM, no external API calls) and rejects low-quality candidates before any token spend.
 4. **Gate 2 (Volatility Analyst + Risk Analyst)** runs in parallel and determines whether the buyer is paying fair implied volatility relative to the ticker’s own history, sector peers, and the broader market. Gate 2 is deterministic and designed to be low-latency.
-5. **Gate 3** runs three analysts in parallel: **Sentiment Analyst** (UW headlines + Finnhub buzz + Reddit), **Insider Tracker** (UW insider Form 4 / buy-sell / flow + congressional holders & trades + Finnhub insider transactions + optional MSPR), and a **Sector Analyst** (deterministic UW sector/market tide + economic calendar + optional FDA signals for biotech sectors; no LLM). Insider Tracker skips the LLM with a neutral `SubScore` when there is no insider and no congressional signal; otherwise it calls Claude with a dedicated prompt (see [token budget](#insider-tracker-token-budget)).
-6. **Grader (Agent B)** (when enabled) builds enriched context via UW endpoints, calls the main grader LLM, parses/validates output, audits to SQLite, and emits passing `ScoredTrade` results.
+5. **Gate 3** runs three specialists in parallel (**Sentiment**, **Insider**, **Sector**), each producing a `SubScore` (failures become skipped neutral scores so the pipeline continues). Insider Tracker may skip its LLM when there is no qualifying data (see [Insider Tracker (Gate 3)](#insider-tracker-gate-3)).
+6. **Aggregation + synthesis** (when `grader.enabled` is true) merges all six sub-scores (flow, vol, risk, sentiment, insider, sector), computes a renormalized weighted average, population stdev, agreement label, and conflict flags (`grader.aggregator`). **Synthesis** (`grader.synthesis`) builds a dedicated prompt (`grader.synthesis_prompt`), calls Claude once, parses JSON, applies deterministic score caps, sets verdict from the final score (≥70 pass), sets `TradeRiskParams.recommended_position_size` to `min(LLM modifier, risk analyst size)`, logs every outcome to `grades` in `data/trades.db`, and enqueues a `ScoredTrade` only if the final score ≥ `grader.score_threshold`.
+7. **Legacy `Grader` class** (`grader.grader`) — older single-shot “context builder → one LLM” path kept for unit tests; **production** `grader.main` uses `run_gate3` + `SynthesisAgent` instead.
 
 ---
 
@@ -226,22 +259,47 @@ async def example(api_token: str) -> None:
 
 ## How the Grader Works
 
-Before any LLM call, candidates pass through **Gate 1 (flow analyst)**:
+The grader runs as `grader.main.run_grader`: it drains the same `asyncio.Queue` the scanner fills. When `grader.enabled` is **true** (default), each candidate goes through Gates 1 → 2 → 3 (specialists + synthesis). When **false**, only Gate 1 runs and survivors are forwarded with `grade=None` (pass-through).
 
-1. **Gate 1 scoring (deterministic)** — Converts the scanner `Candidate` into `FlowCandidate` (`grader.agents.flow_analyst.candidate_to_flow`), checks ticker exclusion lists (ETFs/index/VIX products), scores trade mechanics 1–100 using constants in `shared.filters`, and logs every decision to the `flow_scores` table in `data/trades.db`. Candidates below `GATE_THRESHOLDS.flow_analyst_min` are discarded.
+1. **Gate 1 (flow analyst, deterministic)** — Converts `Candidate` → `FlowCandidate`, applies exclusions and flow scoring from `shared.filters`, logs to `flow_scores`. Below `GATE_THRESHOLDS.flow_analyst_min` → discard.
 
-After Gate 1, Agent B (the grader) consumes the remaining candidates and runs them through:
+2. **Gate 2 (volatility + risk, deterministic)** — Volatility analyst (UW vol/chain context) and **RiskConvictionScore** from the risk analyst run in parallel. Short-circuit if untradeable / zero position size. Otherwise pass if mean(flow, vol, risk) ≥ `GATE_THRESHOLDS.deterministic_avg_min` (same spirit as `gate2_avg_threshold` in config comments).
 
-2. **Gate 2 scoring (deterministic)** — Runs the volatility analyst (4 UW endpoints: IV rank, vol stats, term structure, option chains) and the risk analyst (conviction via structural risk accepted) in parallel, then checks the average of (flow + vol + risk) against `GATE_THRESHOLDS.gate2_avg_threshold`. The risk path fetches option chains, realized volatility, and earnings date context, then computes a pure deterministic score (no LLM, no API calls inside scoring).
-3. **Gate 3 (parallel LLM / context analysts)** — **Sentiment Analyst** builds `SentimentContext` from UW/Finnhub/Reddit and calls the sentiment prompt. **Insider Tracker** builds `InsiderContext` (7 parallel data sources; see below) and either skips with a neutral score or calls Claude with `max_tokens=300` for that agent only. **Sector Analyst** builds `SectorContext` from UW (`sector-tide`, `market-tide`, `economic-calendar`, `sector-etfs`, and `fda-calendar` when the ticker’s sector is Healthcare) and returns a deterministic 1–100 `SubScore` (no LLM). If context construction throws, the sector agent returns a neutral `SubScore(score=50, skipped=True)`. Failures in sentiment or insider agents are non-fatal and return neutral `SubScore(score=50, skipped=True)`.
-4. **Context builder** — Fetches quote, greeks, news, insider/congressional trades from the Unusual Whales API (concurrent, with graceful degradation on partial failures).
-5. **Prompt assembly** — Renders system + user prompts from `GradingContext`, including the `GradeResponse` JSON schema.
-6. **LLM call (main grader)** — Sends to Claude (default: `claude-sonnet-4-20250514`) with the grader `max_tokens` (default 512).
-7. **Parse & validate** — Strips markdown fences, extracts JSON, validates with Pydantic. On parse failure, retries once.
-8. **Audit** — Writes every grading decision to the `grades` table in `data/trades.db`.
-9. **Routing** — If score >= `score_threshold` (default 70), emits a `ScoredTrade` to the scored queue; otherwise returns `None`.
+3. **Gate 3 (`run_gate3` in `grader.gate3`)** — Runs sentiment, insider, and sector `score()` coroutines in parallel. Exceptions → skipped `SubScore(score=50)`. Builds the six-agent map, runs **`Aggregator`**, then **`SynthesisAgent.synthesize`**. Successful synthesis always writes a row to **`grades`**; a **`ScoredTrade`** is pushed to the scored queue only if final score ≥ `grader.score_threshold`.
 
-With `grader.enabled: false` in config, the pipeline applies **Gate 1 only** and forwards survivors as `ScoredTrade` with `grade=None` (no Gate 2, no Gate 3, no LLM calls).
+4. **Legacy path** — `grader.grader.Grader` + `context_builder` + `build_user_prompt`/`parse_grade_response` remains for tests; it is **not** used by `run_grader` today.
+
+With `grader.enabled: false`, the pipeline applies **Gate 1 only** and forwards survivors as `ScoredTrade` with `grade=None` and `risk=None` (no Gate 2, Gate 3, or LLM calls).
+
+---
+
+## Synthesis layer (Gate 3)
+
+The synthesis step is the **last** graded stage: one structured Claude call that turns six `SubScore` rows plus deterministic aggregate metadata into a final **1–100** score and execution hints.
+
+### Data flow
+
+1. **Inputs** — `dict[str, SubScore]` for `flow_analyst`, `volatility_analyst`, `risk_analyst`, `sentiment_analyst`, `insider_tracker`, `sector_analyst`. Skipped agents are excluded from the weighted average; weights are **renormalized** over active agents (`AgentWeights` in `shared.filters`).
+2. **Aggregator** (`src/grader/aggregator.py`) — Computes `weighted_average`, population **stdev** of active scores, `agent_agreement` (`strong` if stdev &lt; 10, `moderate` if ≤ 20, else `weak`), and **conflict flags** (e.g. high flow + low risk, sentiment vs flow, insider vs flow, sector headwind, vol+risk both low, unanimous high conviction). Extracts **`RiskConvictionScore`** when present for prompt risk fields and position sizing.
+3. **Prompt** (`src/grader/synthesis_prompt.py`) — Fixed system prompt (bands, rules, JSON shape) + per-candidate user block: candidate fields, each agent’s score/rationale/top signals, aggregation lines, risk parameters, conflicts, skipped agents.
+4. **LLM** — `SynthesisAgent` uses `LLMClient.complete` with `grader.model`, `grader.max_tokens`, `grader.timeout_seconds` from `config/rules.yaml`.
+5. **Post-processing** (`src/grader/synthesis.py`) — Parse JSON (markdown fences tolerated via `grader.parser._extract_json`). **Deterministic caps:** e.g. flow ≥75 with risk &lt;40 → score capped at 65; vol &lt;40 and risk &lt;40 → cap 65; two or more non-skipped agents with score &lt;35 → cap 55; then clamp 1–100. **Verdict** is always derived from the capped score (≥70 `pass`). **`recommended_position_size`** = `min(position_size_modifier from LLM, risk analyst size)` into `TradeRiskParams` (stop/spread copied from risk analyst when available). Retries on parse failure: **`max_parse_retries` + 1** attempts total.
+
+### Approximate cost / latency
+
+Roughly **one** medium-sized prompt + **~150–250** tokens JSON out per candidate that reaches synthesis (plus three specialist calls earlier in Gate 3). Order-of-magnitude: **~$0.003** and **~0.5–1s** for synthesis alone, depending on model pricing and network (not a guarantee).
+
+### Key files
+
+| File | Role |
+|------|------|
+| `src/grader/aggregator.py` | `Aggregator`, `AggregatedResult`, conflict detectors |
+| `src/grader/synthesis_prompt.py` | System + user prompt for synthesis |
+| `src/grader/synthesis.py` | `SynthesisAgent`, caps, `log_synthesis_grade`, `SynthesisParseError` |
+| `src/grader/gate3.py` | `run_gate3` — specialists ∥ → aggregate → synthesize → threshold |
+| `tests/test_synthesis.py` | Unit/integration coverage for aggregator, prompts, synthesis, gate3 |
+
+Structured log events to watch: `gate3.llm_agents.start` / `gate3.llm_agents.complete`, `gate3.aggregated`, `synthesis.complete`, `synthesis.score_capped`, `synthesis.parse_retry`, `gate3.passed`, `gate3.filtered`, `gate3.synthesis_failed`.
 
 ---
 
@@ -266,7 +324,7 @@ The sentiment analyst is a crowd/noise filter, not a "bullish news" engine. Core
 - Agent file: `src/grader/agents/sentiment_analyst.py`
 - Prompt/template: `src/grader/prompt.py`
 - Model types: `src/grader/models.py` (`SentimentContext`, `SentimentGrade`, etc.)
-- Gate 3 orchestrator: `src/grader/gate3.py`
+- Gate 3: specialists are invoked from `run_gate3` in `src/grader/gate3.py` (aggregation + synthesis in the same module’s pipeline)
 
 Any source failure degrades gracefully to neutral defaults; sentiment never blocks the rest of the pipeline.
 
@@ -274,7 +332,7 @@ Any source failure degrades gracefully to neutral defaults; sentiment never bloc
 
 ## Insider Tracker (Gate 3)
 
-The **Insider Tracker** answers whether corporate insiders and congressional holders are aligned with the unusual options flow. It is LLM-powered (same Claude model family as the rest of the grader) and runs **in parallel** with the sentiment and sector agents (`src/grader/gate3.py`).
+The **Insider Tracker** answers whether corporate insiders and congressional holders are aligned with the unusual options flow. It is LLM-powered (same Claude model family as the rest of the grader) and runs **in parallel** with the sentiment and sector agents inside `run_gate3` (`src/grader/gate3.py`).
 
 ### Data sources (API call budget)
 
@@ -360,14 +418,17 @@ Ensure the venv is activated and API keys are set (see [Getting Started](#gettin
 Run a short forced pipeline, then inspect the structured logs for per-candidate volatility scoring:
 
 ```bash
-# Run end-to-end for a few cycles (scanner -> Gate 1 -> Gate 2 -> Gate 3 sentiment -> grader)
+# Run end-to-end for a few cycles (scanner -> Gate 1 -> Gate 2 -> Gate 3 -> synthesis)
 python -m scanner.run_pipeline --force --max-cycles 3
+# or: whale-pipeline --force --max-cycles 3
 
-# See volatility analyst score summaries (structlog event: vol_analyst.scored)
+# Volatility analyst score summaries (structlog event: vol_analyst.scored)
 jq -c 'select(.event == "vol_analyst.scored") | {ticker, score, abs_score, hist_score, mkt_score, signal_count}' scanner.json.log
 
-# See Gate 3 sentiment summaries
-jq -c 'select(.event == "gate3.result") | {ticker, scores}' scanner.json.log
+# Gate 3: after specialists + aggregate + synthesis
+jq -c 'select(.event == "gate3.aggregated") | {ticker, weighted_avg, stdev, agreement, conflicts}' scanner.json.log
+jq -c 'select(.event == "synthesis.complete") | {ticker, score, verdict, key_signal}' scanner.json.log
+jq -c 'select(.event == "gate3.passed" or .event == "gate3.filtered") | {event, ticker, score, threshold}' scanner.json.log
 ```
 
 Notes:
@@ -387,13 +448,15 @@ Notes:
 ```bash
 # Full pipeline (scanner + grader) — test run, 5 cycles
 python -m scanner.run_pipeline --force --max-cycles 5
+whale-pipeline --force --max-cycles 5
 
 # Full pipeline — live during market hours
 python -m scanner.run_pipeline
+whale-pipeline
 
 # Scanner only (no grader)
 python -m scanner.main --force --max-cycles 5
-python -m scanner.main
+whale-scanner --force --max-cycles 5
 ```
 
 ### Output Locations
@@ -512,8 +575,8 @@ whale-scanner/
 ├── src/
 │   ├── shared/                   # Cross-agent code
 │   │   ├── __init__.py
-│   │   ├── filters.py            # Gate thresholds, InsiderScoringConfig, ticker exclusions
-│   │   ├── models.py             # Candidate, SignalMatch, FlowCandidate, SubScore
+│   │   ├── filters.py            # Gate thresholds, AgentWeights, InsiderScoringConfig, flow/vol/risk configs
+│   │   ├── models.py             # Candidate, SignalMatch, FlowCandidate, SubScore, RiskConvictionScore
 │   │   ├── finnhub_client.py     # Async Finnhub REST (insider transactions + MSPR)
 │   │   ├── db.py                 # SQLite connection + grades/scans/executions/flow_scores tables
 │   │   └── config.py             # YAML loader + env injection
@@ -547,8 +610,11 @@ whale-scanner/
 │       ├── main.py               # Consumer loop: candidate_queue → scored_queue
 │       ├── gate1.py              # Gate 1: deterministic flow analyst + SQLite logging
 │       ├── gate2.py              # Gate 2: deterministic volatility + risk (parallel) + threshold
-│       ├── gate3.py              # Gate 3: sentiment + insider + sector SubScores in parallel
-│       ├── grader.py             # Orchestrator (context → LLM → parse → log)
+│       ├── gate3.py              # Gate 3: specialists ∥ → Aggregator → SynthesisAgent → threshold
+│       ├── aggregator.py         # Deterministic merge of six SubScores + conflicts
+│       ├── synthesis.py          # Final Claude call, caps, TradeRiskParams, grade logging
+│       ├── synthesis_prompt.py   # System + user prompts for synthesis
+│       ├── grader.py             # Legacy single-shot grader (tests; not used by run_grader)
 │       ├── context/
 │       │   ├── __init__.py
 │       │   ├── sector_cache.py   # Daily-refresh market/sector vol benchmarks (in-memory)
@@ -592,7 +658,8 @@ whale-scanner/
 │   ├── test_sentiment_ctx.py
 │   ├── test_insider_tracker.py
 │   ├── test_sector_analyst.py
-│   └── test_grader.py
+│   ├── test_grader.py
+│   └── test_synthesis.py         # Aggregator, synthesis prompts, SynthesisAgent, run_gate3
 ├── scripts/
 │   ├── backfill.py
 │   └── replay.py
@@ -630,9 +697,14 @@ Defined in `shared/models.py`. The output model emitted from scanner to grader:
 | `market_tide_aligned` | Whether market sentiment agrees with the signal direction |
 | `raw_alert_id` | Original UW API alert ID for traceability |
 
-### ScoredTrade and GradeResponse
+### ScoredTrade, GradeResponse, and TradeRiskParams
 
-Defined in `grader/models.py`. A `ScoredTrade` is a candidate that passed grading (score ≥ threshold). It wraps the `Candidate`, a `GradeResponse` (score 1–100, verdict pass/fail, rationale, signals_confirmed), and metadata (model_used, latency_ms, token counts). In pass-through mode, `grade` may be `None`.
+Defined in `grader/models.py`. A **`ScoredTrade`** is emitted when the final synthesis score ≥ `grader.score_threshold` (or in pass-through mode when Gate 1 alone runs). It includes:
+
+- **`Candidate`** — original scanner payload.
+- **`grade`** — `GradeResponse`: score 1–100, `verdict` (`pass` if score ≥ 70 after caps), `rationale`, `signals_confirmed`, optional synthesis fields (`confidence`, `conflict_resolution`, `key_signal`, `position_size_modifier`). In pass-through mode, `grade` is `None`.
+- **`risk`** — `TradeRiskParams` when synthesis ran: `recommended_position_size` (capped by risk analyst), `recommended_stop_loss_pct`, `max_entry_spread_pct` (from risk analyst). `None` in pass-through.
+- **Metadata** — `model_used`, `latency_ms`, `input_tokens`, `output_tokens`, `graded_at`.
 
 ### DarkPoolPrint and MarketTide
 
@@ -709,7 +781,7 @@ The `DedupCache` prevents the same trade from being flagged across consecutive p
 **Grader DB** (`data/trades.db`): `shared.db.get_db()` creates:
 
 - `flow_scores` — every Gate 1 decision (candidate_id, score, skipped/skip_reason, rationale, signals, scored_at)
-- `grades` — every LLM grading decision (candidate_id, score, verdict, rationale, model, token counts, latency)
+- `grades` — every synthesis outcome (and legacy grader runs in tests): candidate_id, score, verdict, rationale, model, token counts, latency
 
 ---
 
@@ -757,7 +829,7 @@ The `grader` section in `config/rules.yaml` controls Agent B:
 | `model` | `claude-sonnet-4-20250514` | Claude model for grading |
 | `max_tokens` | 512 | Max output tokens per LLM call |
 | `timeout_seconds` | 15 | LLM request timeout |
-| `max_parse_retries` | 1 | Retries on JSON parse failure |
+| `max_parse_retries` | 1 | Synthesis only: extra attempts after a bad JSON response (**total** attempts = `max_parse_retries + 1`) |
 | `enabled` | `true` | If `false`, pass-through mode (no LLM, grade=None) |
 
 ---
@@ -792,10 +864,11 @@ A heartbeat file at `data/heartbeat.txt` is updated every cycle with `datetime.u
 ```bash
 cd whale-scanner
 python3.11 -m venv .venv
-source .venv/bin/activate
+source .venv/bin/activate   # Windows: .venv\Scripts\activate
 pip install -e ".[dev,grader]"
-cp .env.example .env   # Set UW_API_TOKEN and ANTHROPIC_API_KEY
+cp .env.example .env        # Set UW_API_TOKEN, ANTHROPIC_API_KEY, FINNHUB_API_KEY (for sentiment/insider)
 python -m scanner.run_pipeline --force --max-cycles 3
+# or: whale-pipeline --force --max-cycles 3
 ```
 
 See [Getting Started](#getting-started) for full instructions.
@@ -807,22 +880,22 @@ See [Getting Started](#getting-started) for full instructions.
 Tests use `pytest` with `pytest-asyncio` for async support and `respx` for mocking HTTP calls.
 
 ```bash
-# Run all tests (scanner + grader)
-python -m pytest -v
+# Run all tests (scanner + grader + synthesis)
+python -m pytest tests/ -v
 
-# Run grader tests only
+# Synthesis pipeline (aggregator, prompts, SynthesisAgent, run_gate3)
+python -m pytest tests/test_synthesis.py -v --tb=short
+
+# Grader unit tests (legacy Grader class + integration)
 python -m pytest tests/test_grader.py tests/test_grader_models.py tests/test_context_builder.py tests/test_prompt.py tests/test_llm_client.py tests/test_parser.py -v
 
-# Run the new deterministic risk analyst suite
+# Deterministic risk analyst suite
 python -m pytest tests/test_risk_analyst.py -v --tb=short
 ```
 
-Ensure the venv is activated and the project is installed (`pip install -e ".[dev,grader]"`).
+Ensure the venv is activated and the project is installed (`pip install -e ".[dev,grader]"`). Pytest is configured with `pythonpath = ["."]` in `pyproject.toml` so imports like `tests.fixtures.*` resolve when running from the repo root.
 
-Sector benchmark cache tests live in `tests/test_sector_cache.py`.
-Volatility analyst tests live in `tests/test_vol_analyst.py`.
-Risk analyst tests live in `tests/test_risk_analyst.py`.
-Sector analyst (deterministic Gate 3) tests live in `tests/test_sector_analyst.py`.
+Notable suites: `tests/test_sector_cache.py`, `tests/test_vol_analyst.py`, `tests/test_risk_analyst.py`, `tests/test_sector_analyst.py`, `tests/test_sentiment_analyst.py`, `tests/test_insider_tracker.py`, `tests/test_flow_analyst.py`.
 
 If your default `python` is not 3.11+, run tests with `python3.11 -m pytest ...` (project requires Python 3.11+).
 
@@ -861,6 +934,14 @@ docker compose -f docker/docker-compose.yaml up --build
 
 The compose file mounts `data/` for SQLite persistence and `config/` for live config changes without rebuilds.
 
+The bundled **`docker/Dockerfile`** default **`CMD`** runs **`python -m scanner.main`** (scanner loop **only** — no grader consumer). To run the **full pipeline** (scanner + grading + synthesis) in a container, override the command, for example:
+
+```bash
+docker compose -f docker/docker-compose.yaml run --rm scanner python -m scanner.run_pipeline
+```
+
+Ensure `UW_API_TOKEN`, `ANTHROPIC_API_KEY`, and (for Gate 3 specialists) `FINNHUB_API_KEY` are set in `.env` or the compose environment.
+
 ### Minimal VPS
 
 A $5/month VPS (1 CPU, 1 GB RAM) is sufficient. The scanner is I/O-bound (waiting on HTTP responses), not CPU-bound. Run behind `systemd` or `supervisord` for process management.
@@ -879,7 +960,9 @@ A $5/month VPS (1 CPU, 1 GB RAM) is sufficient. The scanner is I/O-bound (waitin
 | `aiosqlite` | Async SQLite |
 | `asyncio-throttle` | Rate limiting |
 
-Optional `grader` extra: `anthropic` (Claude SDK).
+Optional **`grader`** extra: `anthropic` (Claude SDK).
+
+**Console scripts** (after `pip install -e .`): `whale-scanner` → `scanner.main:main`, `whale-pipeline` → `scanner.run_pipeline:cli`.
 
 Dev: `pytest`, `pytest-asyncio`, `respx`, `ruff`, `mypy`.
 

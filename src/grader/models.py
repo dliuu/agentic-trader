@@ -48,6 +48,16 @@ class GradingContext(BaseModel):
     market_cap: float | None = None
 
 
+class TradeRiskParams(BaseModel):
+    """Execution risk parameters passed to Agent C (from risk analyst + synthesis)."""
+
+    model_config = {"extra": "forbid"}
+
+    recommended_position_size: float = 0.0
+    recommended_stop_loss_pct: float = 0.0
+    max_entry_spread_pct: float = 0.0
+
+
 class GradeResponse(BaseModel):
     """Validated LLM output. This is the JSON schema included in the prompt."""
 
@@ -57,6 +67,11 @@ class GradeResponse(BaseModel):
     signals_confirmed: list[str]  # Which of the scanner's signals the LLM agrees with
     risk_factors: list[str] = []  # Concerns the LLM flagged
     likely_directional: bool  # LLM's judgment: directional bet vs hedge
+    # Synthesis agent (optional — legacy single-shot grader leaves these unset)
+    confidence: str | None = None
+    conflict_resolution: str | None = None
+    key_signal: str | None = None
+    position_size_modifier: float | None = None
 
     @field_validator("score")
     @classmethod
@@ -82,6 +97,7 @@ class ScoredTrade(BaseModel):
 
     candidate: Candidate
     grade: GradeResponse | None = None  # None in pass-through mode when grading disabled
+    risk: TradeRiskParams | None = None
     graded_at: datetime
     model_used: str
     latency_ms: int

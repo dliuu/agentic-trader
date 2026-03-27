@@ -8,18 +8,18 @@ from datetime import datetime, timezone
 import httpx
 import structlog
 
+from grader.aggregator import Aggregator
 from grader.agents.insider_tracker import InsiderTracker
 from grader.agents.sector_analyst import SectorAnalyst
 from grader.agents.sentiment_analyst import SentimentAnalyst
 from grader.context.sentiment_ctx import SentimentContextBuilder
-from grader.context_builder import ContextBuilder
-from grader.context.sector_cache import get_sector_cache
 from grader.gate1 import run_gate1
 from grader.gate2 import run_gate2
 from grader.gate3 import run_gate3
-from grader.grader import Grader
 from grader.llm_client import LLMClient
 from grader.models import ScoredTrade
+from grader.synthesis import SynthesisAgent
+from grader.context.sector_cache import get_sector_cache
 from shared.config import load_config
 from shared.filters import InsiderScoringConfig
 from shared.models import Candidate
@@ -36,21 +36,18 @@ async def run_grader(
     grader_cfg = config["grader"]
 
     async with httpx.AsyncClient() as http_client:
-        ctx_builder = ContextBuilder(http_client, config["uw_api_token"])
-        grader: Grader | None = None
         llm: LLMClient | None = None
+        sentiment_agent = None
+        insider_agent = None
+        sector_agent = None
+        synthesis_agent = None
+        aggregator = None
         if grader_cfg.get("enabled", True):
             llm = LLMClient(
                 api_key=config["anthropic_api_key"],
                 model=grader_cfg["model"],
                 max_tokens=grader_cfg["max_tokens"],
                 timeout=grader_cfg["timeout_seconds"],
-            )
-            grader = Grader(
-                context_builder=ctx_builder,
-                llm_client=llm,
-                score_threshold=grader_cfg["score_threshold"],
-                max_parse_retries=grader_cfg["max_parse_retries"],
             )
             sentiment_ctx = SentimentContextBuilder(
                 uw_client=http_client,
@@ -66,10 +63,12 @@ async def run_grader(
                 InsiderScoringConfig(),
             )
             sector_agent = SectorAnalyst(http_client, config["uw_api_token"])
-        else:
-            sentiment_agent = None
-            insider_agent = None
-            sector_agent = None
+            synthesis_agent = SynthesisAgent(
+                llm,
+                max_retries=grader_cfg["max_parse_retries"],
+                max_tokens=grader_cfg["max_tokens"],
+            )
+            aggregator = Aggregator()
 
         while True:
             candidate = await candidate_queue.get()
@@ -88,6 +87,7 @@ async def run_grader(
                     ScoredTrade(
                         candidate=candidate,
                         grade=None,
+                        risk=None,
                         graded_at=datetime.now(timezone.utc),
                         model_used="pass-through",
                         latency_ms=0,
@@ -100,7 +100,7 @@ async def run_grader(
 
             # Gate 2: deterministic volatility + risk in parallel.
             sector_cache = await get_sector_cache(http_client, config["uw_api_token"])
-            passed_gate2, _, _ = await run_gate2(
+            passed_gate2, vol_score, risk_score = await run_gate2(
                 candidate=candidate,
                 flow_score=flow_score,
                 client=http_client,
@@ -111,26 +111,30 @@ async def run_grader(
                 candidate_queue.task_done()
                 continue
 
-            if grader is None:
+            if (
+                sentiment_agent is None
+                or insider_agent is None
+                or sector_agent is None
+                or synthesis_agent is None
+                or aggregator is None
+            ):
                 candidate_queue.task_done()
                 continue
 
-            if sentiment_agent is not None and insider_agent is not None and sector_agent is not None:
-                gate3_scores = await run_gate3(
-                    candidate,
-                    sentiment=sentiment_agent,
-                    insider=insider_agent,
-                    sector=sector_agent,
-                )
-                log.info(
-                    "gate3.result",
-                    ticker=candidate.ticker,
-                    scores={s.agent: s.score for s in gate3_scores},
-                )
-
-            result = await grader.grade(candidate)
-            if result is not None:
-                await scored_queue.put(result)
+            scored_trade = await run_gate3(
+                candidate=candidate,
+                flow_score=flow_score,
+                vol_score=vol_score,
+                risk_score=risk_score,
+                sentiment=sentiment_agent,
+                insider=insider_agent,
+                sector=sector_agent,
+                synthesis_agent=synthesis_agent,
+                aggregator=aggregator,
+                final_threshold=grader_cfg["score_threshold"],
+            )
+            if scored_trade is not None:
+                await scored_queue.put(scored_trade)
 
             candidate_queue.task_done()
 
