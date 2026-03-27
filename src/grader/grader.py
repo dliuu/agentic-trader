@@ -11,7 +11,7 @@ from shared.models import Candidate
 
 from grader.context_builder import ContextBuilder
 from grader.llm_client import LLMClient, LLMResponse
-from grader.models import GradingContext, GradeResponse, ScoredTrade
+from grader.models import GradeResponse, ScoredTrade
 from grader.parser import ParseError, parse_grade_response
 from grader.parser import RETRY_PROMPT
 from grader.prompt import build_system_prompt, build_user_prompt

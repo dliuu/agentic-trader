@@ -9,6 +9,7 @@ import httpx
 import structlog
 
 from grader.agents.insider_tracker import InsiderTracker
+from grader.agents.sector_analyst import SectorAnalyst
 from grader.agents.sentiment_analyst import SentimentAnalyst
 from grader.context.sentiment_ctx import SentimentContextBuilder
 from grader.context_builder import ContextBuilder
@@ -21,26 +22,9 @@ from grader.llm_client import LLMClient
 from grader.models import ScoredTrade
 from shared.config import load_config
 from shared.filters import InsiderScoringConfig
-from shared.models import Candidate, SubScore
+from shared.models import Candidate
 
 log = structlog.get_logger()
-
-
-class _NeutralGate3Agent:
-    """Temporary neutral agent placeholder for Gate 3 peers."""
-
-    def __init__(self, name: str):
-        self._name = name
-
-    async def score(self, candidate: Candidate) -> SubScore:
-        return SubScore(
-            agent=self._name,
-            score=50,
-            rationale=f"{self._name} not implemented yet",
-            signals=[],
-            skipped=True,
-            skip_reason="not_implemented",
-        )
 
 
 async def run_grader(
@@ -81,7 +65,7 @@ async def run_grader(
                 llm,
                 InsiderScoringConfig(),
             )
-            sector_agent = _NeutralGate3Agent("sector_analyst")
+            sector_agent = SectorAnalyst(http_client, config["uw_api_token"])
         else:
             sentiment_agent = None
             insider_agent = None
