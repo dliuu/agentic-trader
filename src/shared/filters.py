@@ -374,6 +374,90 @@ class RiskScoringConfig:
 RISK_SCORING = RiskScoringConfig()
 
 
+# ---------------------------------------------------------------------------
+# Risk Conviction Config (Agent 3 — Risk Analyst)
+# ---------------------------------------------------------------------------
+# Scores how much structural risk the original option buyer voluntarily
+# accepted. Higher risk taken -> higher conviction signal.
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class RiskConvictionConfig:
+    """All thresholds for the risk conviction scorer.
+
+    Every tier list is ordered from lowest threshold to highest.
+    The corresponding points list has len(tiers) + 1 entries -
+    one for each bucket including the "below lowest" and "above highest".
+    """
+
+    baseline_score: int = 50
+
+    # --- Factor 1: Premium Commitment ---
+    # How much absolute capital the buyer put at risk.
+    premium_tiers: tuple[float, ...] = (25_000.0, 75_000.0, 200_000.0, 500_000.0)
+    premium_points: tuple[int, ...] = (-5, 0, 6, 12, 18)
+    #  <25K -> -5 | 25-75K -> 0 | 75-200K -> +6 | 200-500K -> +12 | >500K -> +18
+
+    # --- Factor 2: Time Pressure Accepted ---
+    # Shorter DTE = faster theta decay accepted = higher conviction.
+    # NOTE: tiers are upper bounds, checked descending (0-2 first, then 3-6, etc.)
+    dte_tiers: tuple[int, ...] = (2, 6, 13, 29, 60)
+    dte_points: tuple[int, ...] = (15, 12, 8, 3, -3, -8)
+    #  0-2 DTE -> +15 | 3-6 -> +12 | 7-13 -> +8 | 14-29 -> +3 | 30-60 -> -3 | >60 -> -8
+
+    # --- Factor 3: Spread Cost Absorbed ---
+    # Bid-ask spread % the buyer paid through. Wider = more cost accepted.
+    spread_tiers: tuple[float, ...] = (3.0, 7.0, 12.0, 20.0)
+    spread_points: tuple[int, ...] = (-3, 0, 4, 8, 12)
+    #  <=3% -> -3 | 3-7% -> 0 | 7-12% -> +4 | 12-20% -> +8 | >20% -> +12
+
+    # --- Factor 3b: Fill Aggression Modifier ---
+    # Bonus points based on how the order was filled.
+    sweep_bonus: int = 3
+    block_bonus: int = 1
+    split_bonus: int = 0
+
+    # --- Factor 4: Strike Distance Chosen ---
+    # How far OTM the buyer reached (% from spot).
+    otm_tiers: tuple[float, ...] = (3.0, 8.0, 15.0)
+    otm_points: tuple[int, ...] = (-2, 4, 9, 15)
+    #  0-3% OTM -> -2 | 3-8% -> +4 | 8-15% -> +9 | >15% -> +15
+    itm_points: int = -5  # flat for all ITM options
+
+    # --- Factor 5: Implied Move Ratio ---
+    # required daily move / realized daily vol. Higher = needs bigger tail event.
+    move_ratio_tiers: tuple[float, ...] = (0.3, 0.7, 1.2, 1.8)
+    move_ratio_points: tuple[int, ...] = (-5, 0, 5, 10, 15)
+    #  <=0.3 -> -5 | 0.3-0.7 -> 0 | 0.7-1.2 -> +5 | 1.2-1.8 -> +10 | >1.8 -> +15
+
+    # --- Factor 6: Liquidity Cost Accepted ---
+    # Lower contract volume = buyer accepted illiquidity to get this exact strike/expiry.
+    # NOTE: tiers checked descending (lowest volume first = highest points).
+    volume_tiers: tuple[int, ...] = (50, 100, 500, 1000)
+    volume_points: tuple[int, ...] = (10, 6, 3, 0, -3)
+    #  <50 -> +10 | 50-99 -> +6 | 100-499 -> +3 | 500-999 -> 0 | >=1000 -> -3
+
+    # --- Earnings Modifier ---
+    # Earnings before expiry treated as a catalyst conviction signal.
+    earnings_tight_bracket_days: int = 3
+    earnings_event_window_days: int = 14
+    earnings_tight_modifier: int = 8  # earnings within 3 days of expiry
+    earnings_window_modifier: int = 5  # earnings before expiry, DTE <= 14
+
+    # --- Execution Parameters (derived from final score) ---
+    # Position sizing tiers
+    size_tiers: tuple[int, ...] = (30, 45, 60, 75)
+    size_multipliers: tuple[float, ...] = (0.10, 0.25, 0.50, 0.75, 1.0)
+
+    # Stop loss tiers
+    stop_tiers: tuple[int, ...] = (45, 60, 75)
+    stop_pcts: tuple[float, ...] = (0.20, 0.30, 0.40, 0.50)
+
+    # Max entry spread
+    max_entry_spread_cap: float = 0.15
+    entry_spread_discount: float = 0.80  # accept 80% of what original buyer accepted
+
 # ──────────────────────────────────────────────
 # LLM AGENT WEIGHTS (for synthesis agent)
 # ──────────────────────────────────────────────

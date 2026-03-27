@@ -94,3 +94,40 @@ class SubScore(BaseModel):
     @classmethod
     def clamp_score(cls, v: int) -> int:
         return max(0, min(100, v))
+
+
+class RiskConvictionScore(SubScore):
+    """Extended SubScore with conviction breakdown and execution params.
+
+    The risk analyst scores how much structural risk the original buyer
+    accepted. Higher risk -> higher conviction signal.
+    """
+
+    # --- Factor breakdowns (for transparency / debugging) ---
+    premium_commitment_points: int = 0
+    time_pressure_points: int = 0
+    spread_cost_points: int = 0
+    fill_aggression_points: int = 0
+    strike_distance_points: int = 0
+    move_ratio_points: int = 0
+    liquidity_cost_points: int = 0
+    earnings_modifier: int = 0
+
+    # --- Computed intermediate values ---
+    spread_pct: float | None = None
+    otm_pct: float | None = None
+    move_ratio: float | None = None
+    theta_daily_pct: float | None = None
+    days_to_expiry: int | None = None
+
+    # --- Human-readable conviction signals ---
+    conviction_signals: list[str] = Field(default_factory=list)
+
+    # --- Execution parameters for Agent C ---
+    recommended_position_size: float = 0.0
+    recommended_stop_loss_pct: float = 0.0
+    max_entry_spread_pct: float = 0.0
+
+    # --- Flags ---
+    untradeable: bool = False
+    data_gaps: list[str] = Field(default_factory=list)
