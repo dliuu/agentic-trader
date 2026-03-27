@@ -1,8 +1,8 @@
-"""Prompt templates for the grader LLM."""
+"""Prompt templates for the grader LLM and sentiment analyst."""
 
 import json
 
-from grader.models import GradingContext, GradeResponse
+from grader.models import GradeResponse, GradingContext, SentimentContext
 
 SYSTEM_PROMPT = """You are a quantitative options flow analyst. You receive data about \
 an unusual options trade that was flagged by an automated scanner. Your job is to \
@@ -146,3 +146,82 @@ def build_user_prompt(ctx: GradingContext) -> str:
         insider_block=insider_block,
         signals_block=signals_block,
     )
+
+
+SENTIMENT_ANALYST_SYSTEM = """You are a sentiment analyst for an options trading system.
+
+Your job: determine whether the information environment around a trade is
+FAVORABLE, NEUTRAL, or UNFAVORABLE.
+
+CRITICAL SCORING RULE — silence is golden:
+- A ticker with NO news and NO Reddit mentions is NEUTRAL (score 50).
+  This means the unusual flow has not been noticed. That's fine.
+- A ticker trending on Reddit trading subs (especially r/wallstreetbets,
+  r/Shortsqueeze) is a STRONG NEGATIVE signal. Retail crowd attention
+  means the "edge" from unusual flow is likely already priced in or
+  is a crowded trade. Deduct 15-30 points.
+- A ticker with a catalyst in the news BUT low social chatter is the
+  BEST case — informed money moving before the crowd notices. Add 10-20 points.
+
+Respond ONLY with valid JSON matching this schema:
+{
+  "score": <int 1-100>,
+  "verdict": "pass" | "fail",
+  "rationale": "<2-3 sentences>",
+  "signals_confirmed": ["<signal1>", ...],
+  "risk_factors": ["<risk1>", ...],
+  "crowd_exposure": "none" | "low" | "moderate" | "high"
+}
+"""
+
+
+def build_sentiment_prompt(ctx: SentimentContext) -> str:
+    """Build compact user prompt for sentiment analyst."""
+    lines = [
+        f"TICKER: {ctx.ticker}",
+        f"TRADE DIRECTION: {ctx.trade_direction} ({ctx.option_type})",
+        "",
+        "=== NEWS ===",
+        f"Headlines in last 48h: {ctx.headline_count_48h}",
+    ]
+    if ctx.headlines:
+        lines.append("Recent headlines:")
+        for h in ctx.headlines[:5]:
+            lines.append(f"  - [{h.source}] {h.title}")
+    else:
+        lines.append("No recent headlines found.")
+
+    lines += [
+        "",
+        "=== BUZZ METRICS (Finnhub) ===",
+        f"Articles last week: {ctx.buzz.articles_last_week}",
+        f"Weekly average: {ctx.buzz.weekly_average:.1f}",
+        f"Buzz ratio: {ctx.buzz.buzz_ratio:.2f}x normal",
+        f"Bullish %: {ctx.buzz.bullish_pct:.1f}%",
+        f"Bearish %: {ctx.buzz.bearish_pct:.1f}%",
+        "",
+        "=== REDDIT TRADING SUBS (last 7 days) ===",
+        f"Subreddits with mentions: {ctx.reddit.total_subreddits_with_mentions}/7",
+        f"Total posts found: {ctx.reddit.total_post_count}",
+    ]
+    if ctx.reddit.total_post_count > 0:
+        for rp in ctx.reddit.subreddits:
+            if rp.post_count <= 0:
+                continue
+            snippet = ""
+            if rp.top_post_title:
+                snippet = f' (top: "{rp.top_post_title[:60]}..." score={rp.top_post_score})'
+            lines.append(f"  r/{rp.subreddit}: {rp.post_count} posts{snippet}")
+    else:
+        lines.append("  No mentions found in any trading subreddit.")
+
+    lines += [
+        "",
+        "=== PRE-COMPUTED FLAGS ===",
+        f"Has catalyst: {ctx.has_catalyst}",
+        f"Is quiet (no news + no reddit): {ctx.is_quiet}",
+        f"News aligns with trade direction: {ctx.news_aligns_with_direction}",
+        f"Meme candidate (WSB/Shortsqueeze): {ctx.reddit.is_meme_candidate}",
+        f"Crowded (4+ sub mentions): {ctx.reddit.is_crowded}",
+    ]
+    return "\n".join(lines)

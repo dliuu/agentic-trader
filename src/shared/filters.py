@@ -458,6 +458,41 @@ class RiskConvictionConfig:
     max_entry_spread_cap: float = 0.15
     entry_spread_discount: float = 0.80  # accept 80% of what original buyer accepted
 
+
+# ──────────────────────────────────────────────
+# SENTIMENT ANALYST CONFIG (Gate 3)
+# ──────────────────────────────────────────────
+
+
+@dataclass(frozen=True)
+class SentimentConfig:
+    """All tunable parameters for the sentiment analyst."""
+
+    # Reddit subreddits to scan
+    reddit_subs: tuple[str, ...] = (
+        "wallstreetbets",
+        "options",
+        "stocks",
+        "investing",
+        "thetagang",
+        "Shortsqueeze",
+        "unusual_whales",
+    )
+
+    # Subreddits that trigger meme_candidate flag
+    meme_subs: frozenset[str] = frozenset({"wallstreetbets", "Shortsqueeze"})
+
+    # Thresholds
+    catalyst_headline_min: int = 2
+    crowded_sub_threshold: int = 4
+    buzz_ratio_elevated: float = 2.0
+    meme_post_score_high: int = 500
+
+    # Reddit scan parameters
+    reddit_search_period: str = "week"
+    reddit_search_limit: int = 5
+    reddit_delay_seconds: float = 0.5
+
 # ──────────────────────────────────────────────
 # LLM AGENT WEIGHTS (for synthesis agent)
 # ──────────────────────────────────────────────

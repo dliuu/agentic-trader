@@ -1,9 +1,10 @@
-"""Parse raw LLM output into validated GradeResponse."""
+"""Parse raw LLM output into validated Pydantic response models."""
 
 import json
 import re
 
 import structlog
+from pydantic import BaseModel
 
 from grader.models import GradeResponse
 
@@ -61,6 +62,21 @@ def parse_grade_response(raw: str) -> GradeResponse:
         return GradeResponse.model_validate(parsed)
     except Exception as e:
         log.warning("parse_failed", raw=raw[:200], error=str(e))
+        raise ParseError(f"Failed to parse LLM response: {e}") from e
+
+
+def parse_llm_response(raw: str, model_cls: type[BaseModel]) -> BaseModel:
+    """Parse raw LLM text into any Pydantic model."""
+    cleaned = _extract_json(raw)
+    try:
+        parsed = json.loads(cleaned)
+        if not isinstance(parsed, dict):
+            raise ValueError(f"Expected JSON object, got {type(parsed)}")
+        if "verdict" in parsed:
+            parsed["verdict"] = normalize_verdict(parsed["verdict"])
+        return model_cls.model_validate(parsed)
+    except Exception as e:
+        log.warning("parse_failed", raw=raw[:200], error=str(e), model=model_cls.__name__)
         raise ParseError(f"Failed to parse LLM response: {e}") from e
 
 

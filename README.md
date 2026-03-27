@@ -1,11 +1,11 @@
 # Whale Scanner
 
-A two-agent pipeline for unusual options flow:
+A multi-gate pipeline for unusual options flow:
 
 - **Agent A (Scanner)** — Deterministic rule engine that scans for unusual options flow during US market hours. Polls the [Unusual Whales](https://unusualwhales.com) API, applies configurable filters, scores candidates by multi-signal confluence, and pushes them to the grader.
 - **Gate 1 (Flow Analyst)** — Deterministic post-scanner filter (no LLM, no external API calls). Scores each candidate 1–100 from the in-memory `Candidate` object only, logs every decision to SQLite, and discards candidates below threshold before any LLM tokens are spent.
-- **Gate 2 (Volatility Analyst + Risk Analyst)** — Deterministic “is the buyer getting a good deal?” layer. The **Volatility Analyst** fetches 4 UW volatility/chain endpoints per candidate (no LLM), scores 1–100, and uses the Sector Benchmark Cache for market/sector context. Gate 2 passes when the average of (flow + vol + risk) meets the configured threshold.
-- **Agent B (Grader)** — LLM-powered grading layer (Claude) that scores each candidate 1–100, validates conviction, and emits passing trades to a scored queue.
+- **Gate 2 (Volatility Analyst + Risk Analyst)** — Deterministic “is the buyer getting a good deal?” layer. The **Volatility Analyst** fetches 4 UW volatility/chain endpoints per candidate (no LLM), and the **Risk Analyst** scores structural conviction from buyer risk accepted (premium, DTE, spread, OTM distance, move ratio, liquidity, earnings proximity). Gate 2 passes when the average of (flow + vol + risk) meets the configured threshold.
+- **Gate 3 (Sentiment Analyst + LLM layer)** — Adds a dedicated sentiment/crowding analyst that treats social/news attention as a risk signal ("silence is signal"), then runs the main LLM grader to score conviction and emit passing trades.
 
 **Key features:** Confluence enrichment (dark pool + market tide), deterministic multi-gate filtering (Gate 1 + Gate 2) before any LLM spend, `--force` to bypass market hours, `--max-cycles` for limited runs, dual logging (terminal + `scanner.json.log`), grader pass-through mode (`enabled: false`), and audit logging to SQLite.
 
@@ -28,6 +28,7 @@ See [Getting Started](#getting-started) for full venv setup and run instructions
 - [How the Scanner Works](#how-the-scanner-works)
 - [Sector Benchmark Cache (Market/Sector Vol Benchmarks)](#sector-benchmark-cache-marketsector-vol-benchmarks)
 - [How the Grader Works](#how-the-grader-works)
+- [Sentiment Analyst (Gate 3)](#sentiment-analyst-gate-3)
 - [Running on Live Market Data](#running-on-live-market-data)
 - [Benchmarking Results](#benchmarking-results)
 - [Repository Structure](#repository-structure)
@@ -90,6 +91,7 @@ Edit `.env` and set:
 ```
 UW_API_TOKEN=your_unusual_whales_token
 ANTHROPIC_API_KEY=your_anthropic_api_key
+FINNHUB_API_KEY=your_finnhub_api_key_here
 ```
 
 ### Step 4: Run the pipeline
@@ -148,10 +150,11 @@ The scanner runs as an async producer: every cycle it fetches flow alerts, dark 
 At a high level, the pipeline is:
 
 1. **Scanner (Agent A)** polls the Unusual Whales API for raw flow and confluence signals, deduplicates, applies the rule engine, and emits `Candidate` objects.
-2. **Sector Benchmark Cache** (daily-refresh, in-memory) fetches market/sector volatility benchmarks used for “cheap vs market/sector” context. This cache is designed to be warmed once per trading day and reused across all candidates graded that day.
+2. **Sector Benchmark Cache** (daily-refresh, in-memory) fetches market/sector volatility benchmarks used for "cheap vs market/sector" context. This cache is designed to be warmed once per trading day and reused across all candidates graded that day.
 3. **Filter agent (Gate 1 Flow Analyst)** deterministically scores each `Candidate` from in-memory fields only (no LLM, no external API calls) and rejects low-quality candidates before any token spend.
 4. **Gate 2 (Volatility Analyst + Risk Analyst)** runs in parallel and determines whether the buyer is paying fair implied volatility relative to the ticker’s own history, sector peers, and the broader market. Gate 2 is deterministic and designed to be low-latency.
-5. **Grader (Agent B)** (when enabled) builds enriched context via UW endpoints, calls the LLM, parses/validates output, audits to SQLite, and emits passing `ScoredTrade` results.
+5. **Gate 3 Sentiment Analyst** builds sentiment context from UW headlines + Finnhub buzz + Reddit trading-subreddit scans, then scores crowd exposure (neutral fallback on any data/LLM failure).
+6. **Grader (Agent B)** (when enabled) builds enriched context via UW endpoints, calls the LLM, parses/validates output, audits to SQLite, and emits passing `ScoredTrade` results.
 
 ---
 
@@ -227,15 +230,43 @@ Before any LLM call, candidates pass through **Gate 1 (flow analyst)**:
 
 After Gate 1, Agent B (the grader) consumes the remaining candidates and runs them through:
 
-2. **Gate 2 scoring (deterministic)** — Runs the volatility analyst (4 UW endpoints: IV rank, vol stats, term structure, option chains) and a risk analyst in parallel, then checks the average of (flow + vol + risk) against `GATE_THRESHOLDS.gate2_avg_threshold`. The volatility analyst uses the Sector Benchmark Cache for “cheap vs market/sector” comparisons.
-3. **Context builder** — Fetches quote, greeks, news, insider/congressional trades from the Unusual Whales API (concurrent, with graceful degradation on partial failures).
-4. **Prompt assembly** — Renders system + user prompts from `GradingContext`, including the `GradeResponse` JSON schema.
-5. **LLM call** — Sends to Claude (default: `claude-sonnet-4-20250514`) with a 512-token limit.
-6. **Parse & validate** — Strips markdown fences, extracts JSON, validates with Pydantic. On parse failure, retries once.
-7. **Audit** — Writes every grading decision to the `grades` table in `data/trades.db`.
-8. **Routing** — If score ≥ `score_threshold` (default 70), emits a `ScoredTrade` to the scored queue; otherwise returns `None`.
+2. **Gate 2 scoring (deterministic)** — Runs the volatility analyst (4 UW endpoints: IV rank, vol stats, term structure, option chains) and the risk analyst (conviction via structural risk accepted) in parallel, then checks the average of (flow + vol + risk) against `GATE_THRESHOLDS.gate2_avg_threshold`. The risk path fetches option chains, realized volatility, and earnings date context, then computes a pure deterministic score (no LLM, no API calls inside scoring).
+3. **Gate 3 sentiment scoring (LLM-powered)** — Builds `SentimentContext` from UW/Finnhub/Reddit, then calls the sentiment prompt. Failures are non-fatal and return neutral `SubScore(score=50, skipped=True)`.
+4. **Context builder** — Fetches quote, greeks, news, insider/congressional trades from the Unusual Whales API (concurrent, with graceful degradation on partial failures).
+5. **Prompt assembly** — Renders system + user prompts from `GradingContext`, including the `GradeResponse` JSON schema.
+6. **LLM call** — Sends to Claude (default: `claude-sonnet-4-20250514`) with a 512-token limit.
+7. **Parse & validate** — Strips markdown fences, extracts JSON, validates with Pydantic. On parse failure, retries once.
+8. **Audit** — Writes every grading decision to the `grades` table in `data/trades.db`.
+9. **Routing** — If score >= `score_threshold` (default 70), emits a `ScoredTrade` to the scored queue; otherwise returns `None`.
 
-With `grader.enabled: false` in config, the pipeline **still applies Gate 1**, then skips LLM calls and passes the surviving candidates through as `ScoredTrade` with `grade=None`.
+With `grader.enabled: false` in config, the pipeline applies **Gate 1 only** and forwards survivors as `ScoredTrade` with `grade=None` (no Gate 2, no Gate 3, no LLM calls).
+
+---
+
+## Sentiment Analyst (Gate 3)
+
+The sentiment analyst is a crowd/noise filter, not a "bullish news" engine. Core thesis: **silence is signal**.
+
+- No news + no Reddit mentions => neutral (~50), not negative.
+- Catalyst in news + low social chatter => positive (informed flow ahead of crowd).
+- Strong Reddit presence (especially `r/wallstreetbets` / `r/Shortsqueeze`) => negative (crowded edge).
+
+### Data sources
+
+- UW headlines: `/api/news/headlines?ticker={symbol}&limit=20`
+- Finnhub buzz/sentiment: `/api/v1/news-sentiment?symbol={ticker}`
+- Reddit public `.json` search for 7 trading subreddits:
+  `wallstreetbets`, `options`, `stocks`, `investing`, `thetagang`, `Shortsqueeze`, `unusual_whales`
+
+### Runtime behavior
+
+- Builder file: `src/grader/context/sentiment_ctx.py`
+- Agent file: `src/grader/agents/sentiment_analyst.py`
+- Prompt/template: `src/grader/prompt.py`
+- Model types: `src/grader/models.py` (`SentimentContext`, `SentimentGrade`, etc.)
+- Gate 3 orchestrator: `src/grader/gate3.py`
+
+Any source failure degrades gracefully to neutral defaults; sentiment never blocks the rest of the pipeline.
 
 ---
 
@@ -248,11 +279,14 @@ Ensure the venv is activated and API keys are set (see [Getting Started](#gettin
 Run a short forced pipeline, then inspect the structured logs for per-candidate volatility scoring:
 
 ```bash
-# Run end-to-end for a few cycles (scanner → Gate 1 → Gate 2 → grader)
+# Run end-to-end for a few cycles (scanner -> Gate 1 -> Gate 2 -> Gate 3 sentiment -> grader)
 python -m scanner.run_pipeline --force --max-cycles 3
 
 # See volatility analyst score summaries (structlog event: vol_analyst.scored)
 jq -c 'select(.event == "vol_analyst.scored") | {ticker, score, abs_score, hist_score, mkt_score, signal_count}' scanner.json.log
+
+# See Gate 3 sentiment summaries
+jq -c 'select(.event == "gate3.result") | {ticker, scores}' scanner.json.log
 ```
 
 Notes:
@@ -435,13 +469,14 @@ whale-scanner/
 │       ├── context/
 │       │   ├── __init__.py
 │       │   ├── sector_cache.py   # Daily-refresh market/sector vol benchmarks (in-memory)
-│       │   └── vol_ctx.py        # Normalized volatility context builder for scoring
+│       │   ├── vol_ctx.py        # Normalized volatility context builder for scoring
+│       │   └── risk_ctx.py       # Risk analyst context fetcher (option chains, vol stats, earnings)
 │       ├── context_builder.py    # Enriches Candidate with quote, greeks, news, insider
 │       ├── agents/
 │       │   ├── __init__.py
-│       │   └── flow_analyst.py   # Deterministic Gate 1 scoring engine
+│       │   ├── flow_analyst.py        # Deterministic Gate 1 scoring engine
 │       │   ├── volatility_analyst.py  # Deterministic Gate 2 volatility scorer (4 UW endpoints)
-│       │   └── risk_analyst.py        # Gate 2 risk scorer (placeholder/stub)
+│       │   └── risk_analyst.py        # Deterministic Gate 2 risk conviction scorer
 │       ├── prompt.py             # System + user prompt templates
 │       ├── llm_client.py         # Anthropic SDK wrapper
 │       ├── parser.py             # JSON extract + GradeResponse validation
@@ -462,6 +497,7 @@ whale-scanner/
 │   ├── test_parser.py
 │   ├── test_flow_analyst.py
 │   ├── test_vol_analyst.py
+│   ├── test_risk_analyst.py
 │   └── test_grader.py
 ├── scripts/
 │   ├── backfill.py
@@ -678,16 +714,22 @@ Tests use `pytest` with `pytest-asyncio` for async support and `respx` for mocki
 
 ```bash
 # Run all tests (scanner + grader)
-pytest -v
+python -m pytest -v
 
 # Run grader tests only
-pytest tests/test_grader.py tests/test_grader_models.py tests/test_context_builder.py tests/test_prompt.py tests/test_llm_client.py tests/test_parser.py -v
+python -m pytest tests/test_grader.py tests/test_grader_models.py tests/test_context_builder.py tests/test_prompt.py tests/test_llm_client.py tests/test_parser.py -v
+
+# Run the new deterministic risk analyst suite
+python -m pytest tests/test_risk_analyst.py -v --tb=short
 ```
 
 Ensure the venv is activated and the project is installed (`pip install -e ".[dev,grader]"`).
 
 Sector benchmark cache tests live in `tests/test_sector_cache.py`.
 Volatility analyst tests live in `tests/test_vol_analyst.py`.
+Risk analyst tests live in `tests/test_risk_analyst.py`.
+
+If your default `python` is not 3.11+, run tests with `python3.11 -m pytest ...` (project requires Python 3.11+).
 
 ### Capturing test fixtures
 
