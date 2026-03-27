@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 import httpx
 import structlog
 
+from grader.agents.insider_tracker import InsiderTracker
 from grader.agents.sentiment_analyst import SentimentAnalyst
 from grader.context.sentiment_ctx import SentimentContextBuilder
 from grader.context_builder import ContextBuilder
@@ -18,9 +19,9 @@ from grader.gate3 import run_gate3
 from grader.grader import Grader
 from grader.llm_client import LLMClient
 from grader.models import ScoredTrade
-from shared.models import SubScore
 from shared.config import load_config
-from shared.models import Candidate
+from shared.filters import InsiderScoringConfig
+from shared.models import Candidate, SubScore
 
 log = structlog.get_logger()
 
@@ -73,7 +74,13 @@ async def run_grader(
                 finnhub_api_key=config.get("finnhub_api_key", ""),
             )
             sentiment_agent = SentimentAnalyst(sentiment_ctx, llm)
-            insider_agent = _NeutralGate3Agent("insider_tracker")
+            insider_agent = InsiderTracker(
+                http_client,
+                config["uw_api_token"],
+                config.get("finnhub_api_key", ""),
+                llm,
+                InsiderScoringConfig(),
+            )
             sector_agent = _NeutralGate3Agent("sector_analyst")
         else:
             sentiment_agent = None

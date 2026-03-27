@@ -72,6 +72,32 @@ async def test_client_uses_exact_model_and_max_tokens(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_complete_accepts_max_tokens_override(monkeypatch):
+    create_kwargs = {}
+
+    async def capture_create(**kwargs):
+        nonlocal create_kwargs
+        create_kwargs = kwargs
+        mock_message = MagicMock()
+        mock_message.content = [MagicMock(text="{}")]
+        mock_message.usage = MagicMock(input_tokens=1, output_tokens=1)
+        return mock_message
+
+    mock_client = AsyncMock()
+    mock_client.messages.create = capture_create
+
+    def fake_anthropic(*args, **kwargs):
+        return mock_client
+
+    monkeypatch.setattr("grader.llm_client.anthropic.AsyncAnthropic", fake_anthropic)
+
+    client = LLMClient(api_key="test-key", max_tokens=512)
+    await client.complete("sys", "usr", max_tokens=300)
+
+    assert create_kwargs.get("max_tokens") == 300
+
+
+@pytest.mark.asyncio
 async def test_client_timeout_configurable(monkeypatch):
     """Timeout is configurable (default 15s)."""
     captured_timeout = None

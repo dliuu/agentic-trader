@@ -1,8 +1,14 @@
 """Prompt templates for the grader LLM and sentiment analyst."""
 
+from __future__ import annotations
+
 import json
+from typing import TYPE_CHECKING
 
 from grader.models import GradeResponse, GradingContext, SentimentContext
+
+if TYPE_CHECKING:
+    from grader.context.insider_ctx import InsiderContext
 
 SYSTEM_PROMPT = """You are a quantitative options flow analyst. You receive data about \
 an unusual options trade that was flagged by an automated scanner. Your job is to \
@@ -225,3 +231,129 @@ def build_sentiment_prompt(ctx: SentimentContext) -> str:
         f"Crowded (4+ sub mentions): {ctx.reddit.is_crowded}",
     ]
     return "\n".join(lines)
+
+
+INSIDER_TRACKER_SYSTEM_PROMPT = """You are the Insider Tracker agent in an options trading grading pipeline.
+
+Your job: Determine whether corporate insider behavior and congressional trading activity
+support or contradict the unusual options flow signal.
+
+You will receive pre-computed signals and raw transaction data. Score the insider alignment
+on a 1-100 scale:
+
+SCORING GUIDE:
+- 80-100: Strong insider alignment. Cluster buying in the same direction as the flow,
+          recent large purchases, or notable congressional accumulation.
+- 60-79:  Moderate alignment. Some insider buying, no contradictory signals, or
+          congressional interest without strong timing.
+- 40-59:  Neutral / insufficient data. Few transactions, mixed signals, or data only
+          from one source with no cross-validation.
+- 20-39:  Moderate misalignment. Insiders selling while flow is bullish, or
+          congressional positions being liquidated.
+- 1-19:   Strong misalignment. Cluster selling opposite to the flow direction,
+          especially by C-suite insiders, right before the flow signal.
+
+IMPORTANT CONTEXT:
+- Not all tickers have insider or congressional data. Missing data = neutral, not negative.
+- Insider sales are common for compensation/diversification. Only flag sales as negative
+  if they are unusually large, clustered, or timed suspiciously.
+- Option exercises followed by immediate sales ("M" then "S") are routine. These are
+  less meaningful than open-market purchases ("P").
+- Congressional trades are disclosed with a delay (up to 45 days). Weight them less for
+  timing analysis but they still indicate conviction.
+
+You MUST respond with valid JSON matching this schema:
+{
+  "score": <int 1-100>,
+  "verdict": "pass" | "fail",
+  "rationale": "<2-3 sentences explaining your assessment>",
+  "signals_confirmed": ["<signal1>", "<signal2>"],
+  "risk_factors": ["<risk1>"],
+  "likely_directional": <bool>
+}"""
+
+
+INSIDER_TRACKER_USER_PROMPT = """## Candidate
+- Ticker: {ticker}
+- Option type: {option_type}
+- Trade direction: {trade_direction}
+- Scanned at: {scanned_at}
+
+## Data Availability
+{data_availability_section}
+
+## Pre-Computed Signals
+- Buy/sell ratio (90d): {buy_sell_ratio}
+- Net insider value (90d): ${net_insider_value_90d:,.0f}
+- Days since last insider buy: {days_since_last_buy}
+- Days since last insider sell: {days_since_last_sell}
+- Cluster buys detected: {num_cluster_buys}
+- Cluster sells detected: {num_cluster_sells}
+- UW/Finnhub agreement: {uw_finnhub_agreement}
+- Finnhub MSPR (current month): {mspr_current}
+- MSPR trend: {mspr_trend}
+- Congressional holders: {num_political_holders}
+- Congressional direction (90d): {congressional_direction}
+
+{cluster_details_section}
+
+## Recent Insider Transactions (last 180 days, up to 20 most recent)
+{insider_transactions_section}
+
+## Insider Trades Relative to Flow Signal
+Trades filed BEFORE the flow signal ({num_before} trades):
+{trades_before_section}
+
+Trades filed AFTER the flow signal ({num_after} trades):
+{trades_after_section}
+
+## Congressional Data
+{congressional_section}
+
+Grade this candidate's insider alignment with the unusual options flow."""
+
+
+def build_insider_tracker_user_prompt(ctx: InsiderContext) -> str:
+    """Render insider tracker user prompt from built context."""
+    from grader.context.insider_ctx import (
+        build_cluster_details_section,
+        build_congressional_section,
+        build_data_availability_section,
+        build_insider_transactions_section,
+        format_trades_list,
+    )
+    from shared.filters import InsiderScoringConfig
+
+    cfg = InsiderScoringConfig()
+    d = ctx.derived
+    ratio = d.buy_sell_ratio
+    ratio_s = f"{ratio:.2f}" if ratio is not None else "n/a"
+    mspr_c = f"{d.mspr_current:.2f}" if d.mspr_current is not None else "n/a"
+    agr = d.uw_finnhub_agreement
+    agr_s = "n/a" if agr is None else ("true" if agr else "false")
+
+    return INSIDER_TRACKER_USER_PROMPT.format(
+        ticker=ctx.ticker,
+        option_type=ctx.option_type,
+        trade_direction=ctx.trade_direction,
+        scanned_at=ctx.scanned_at.isoformat(),
+        data_availability_section=build_data_availability_section(ctx),
+        buy_sell_ratio=ratio_s,
+        net_insider_value_90d=d.net_insider_value_90d,
+        days_since_last_buy=d.days_since_last_insider_buy,
+        days_since_last_sell=d.days_since_last_insider_sell,
+        num_cluster_buys=len(d.cluster_buys),
+        num_cluster_sells=len(d.cluster_sells),
+        uw_finnhub_agreement=agr_s,
+        mspr_current=mspr_c,
+        mspr_trend=d.mspr_trend or "n/a",
+        num_political_holders=d.num_political_holders,
+        congressional_direction=d.congressional_direction or "n/a",
+        cluster_details_section=build_cluster_details_section(ctx),
+        insider_transactions_section=build_insider_transactions_section(ctx, cfg.max_transactions_in_prompt),
+        num_before=len(d.insider_trades_before_flow),
+        trades_before_section=format_trades_list(d.insider_trades_before_flow),
+        num_after=len(d.insider_trades_after_flow),
+        trades_after_section=format_trades_list(d.insider_trades_after_flow),
+        congressional_section=build_congressional_section(ctx),
+    )

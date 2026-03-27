@@ -493,6 +493,38 @@ class SentimentConfig:
     reddit_search_limit: int = 5
     reddit_delay_seconds: float = 0.5
 
+
+# ──────────────────────────────────────────────
+# INSIDER TRACKER (Gate 3)
+# ──────────────────────────────────────────────
+
+
+@dataclass(frozen=True)
+class InsiderScoringConfig:
+    """All tunable parameters for the insider tracker."""
+
+    cluster_window_days: int = 14
+    cluster_min_insiders: int = 2
+
+    transaction_lookback_days: int = 180
+    ratio_lookback_days: int = 90
+    congressional_lookback_days: int = 90
+
+    max_transactions_in_prompt: int = 20
+
+    min_sources_for_full_confidence: int = 5
+    min_confidence_factor: float = 0.5
+
+    min_transactions_for_analysis: int = 1
+
+    mspr_bullish_threshold: float = 20.0
+    mspr_bearish_threshold: float = -20.0
+
+    buy_codes: tuple[str, ...] = ("P",)
+    sell_codes: tuple[str, ...] = ("S",)
+    neutral_codes: tuple[str, ...] = ("M", "G", "A", "F", "C")
+
+
 # ──────────────────────────────────────────────
 # LLM AGENT WEIGHTS (for synthesis agent)
 # ──────────────────────────────────────────────

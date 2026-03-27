@@ -5,7 +5,7 @@ A multi-gate pipeline for unusual options flow:
 - **Agent A (Scanner)** — Deterministic rule engine that scans for unusual options flow during US market hours. Polls the [Unusual Whales](https://unusualwhales.com) API, applies configurable filters, scores candidates by multi-signal confluence, and pushes them to the grader.
 - **Gate 1 (Flow Analyst)** — Deterministic post-scanner filter (no LLM, no external API calls). Scores each candidate 1–100 from the in-memory `Candidate` object only, logs every decision to SQLite, and discards candidates below threshold before any LLM tokens are spent.
 - **Gate 2 (Volatility Analyst + Risk Analyst)** — Deterministic “is the buyer getting a good deal?” layer. The **Volatility Analyst** fetches 4 UW volatility/chain endpoints per candidate (no LLM), and the **Risk Analyst** scores structural conviction from buyer risk accepted (premium, DTE, spread, OTM distance, move ratio, liquidity, earnings proximity). Gate 2 passes when the average of (flow + vol + risk) meets the configured threshold.
-- **Gate 3 (Sentiment Analyst + LLM layer)** — Adds a dedicated sentiment/crowding analyst that treats social/news attention as a risk signal ("silence is signal"), then runs the main LLM grader to score conviction and emit passing trades.
+- **Gate 3 (Sentiment + Insider + Sector + LLM layer)** — Runs **Sentiment Analyst**, **Insider Tracker**, and a placeholder **Sector Analyst** in parallel (each can emit a `SubScore`), then runs the main LLM grader to score conviction and emit passing trades. The Insider Tracker scores whether insiders and congressional holders align with the flow (UW + Finnhub; see [Insider Tracker (Gate 3)](#insider-tracker-gate-3)).
 
 **Key features:** Confluence enrichment (dark pool + market tide), deterministic multi-gate filtering (Gate 1 + Gate 2) before any LLM spend, `--force` to bypass market hours, `--max-cycles` for limited runs, dual logging (terminal + `scanner.json.log`), grader pass-through mode (`enabled: false`), and audit logging to SQLite.
 
@@ -29,6 +29,7 @@ See [Getting Started](#getting-started) for full venv setup and run instructions
 - [Sector Benchmark Cache (Market/Sector Vol Benchmarks)](#sector-benchmark-cache-marketsector-vol-benchmarks)
 - [How the Grader Works](#how-the-grader-works)
 - [Sentiment Analyst (Gate 3)](#sentiment-analyst-gate-3)
+- [Insider Tracker (Gate 3)](#insider-tracker-gate-3)
 - [Running on Live Market Data](#running-on-live-market-data)
 - [Benchmarking Results](#benchmarking-results)
 - [Repository Structure](#repository-structure)
@@ -153,8 +154,8 @@ At a high level, the pipeline is:
 2. **Sector Benchmark Cache** (daily-refresh, in-memory) fetches market/sector volatility benchmarks used for "cheap vs market/sector" context. This cache is designed to be warmed once per trading day and reused across all candidates graded that day.
 3. **Filter agent (Gate 1 Flow Analyst)** deterministically scores each `Candidate` from in-memory fields only (no LLM, no external API calls) and rejects low-quality candidates before any token spend.
 4. **Gate 2 (Volatility Analyst + Risk Analyst)** runs in parallel and determines whether the buyer is paying fair implied volatility relative to the ticker’s own history, sector peers, and the broader market. Gate 2 is deterministic and designed to be low-latency.
-5. **Gate 3 Sentiment Analyst** builds sentiment context from UW headlines + Finnhub buzz + Reddit trading-subreddit scans, then scores crowd exposure (neutral fallback on any data/LLM failure).
-6. **Grader (Agent B)** (when enabled) builds enriched context via UW endpoints, calls the LLM, parses/validates output, audits to SQLite, and emits passing `ScoredTrade` results.
+5. **Gate 3** runs three analysts in parallel: **Sentiment Analyst** (UW headlines + Finnhub buzz + Reddit), **Insider Tracker** (UW insider Form 4 / buy-sell / flow + congressional holders & trades + Finnhub insider transactions + optional MSPR), and a **Sector Analyst** placeholder (neutral skip until implemented). Insider Tracker skips the LLM with a neutral `SubScore` when there is no insider and no congressional signal; otherwise it calls Claude with a dedicated prompt (see [token budget](#insider-tracker-token-budget)).
+6. **Grader (Agent B)** (when enabled) builds enriched context via UW endpoints, calls the main grader LLM, parses/validates output, audits to SQLite, and emits passing `ScoredTrade` results.
 
 ---
 
@@ -231,10 +232,10 @@ Before any LLM call, candidates pass through **Gate 1 (flow analyst)**:
 After Gate 1, Agent B (the grader) consumes the remaining candidates and runs them through:
 
 2. **Gate 2 scoring (deterministic)** — Runs the volatility analyst (4 UW endpoints: IV rank, vol stats, term structure, option chains) and the risk analyst (conviction via structural risk accepted) in parallel, then checks the average of (flow + vol + risk) against `GATE_THRESHOLDS.gate2_avg_threshold`. The risk path fetches option chains, realized volatility, and earnings date context, then computes a pure deterministic score (no LLM, no API calls inside scoring).
-3. **Gate 3 sentiment scoring (LLM-powered)** — Builds `SentimentContext` from UW/Finnhub/Reddit, then calls the sentiment prompt. Failures are non-fatal and return neutral `SubScore(score=50, skipped=True)`.
+3. **Gate 3 (parallel LLM / context analysts)** — **Sentiment Analyst** builds `SentimentContext` from UW/Finnhub/Reddit and calls the sentiment prompt. **Insider Tracker** builds `InsiderContext` (7 parallel data sources; see below) and either skips with a neutral score or calls Claude with `max_tokens=300` for that agent only. **Sector Analyst** is still a neutral placeholder. Failures in any Gate 3 agent are non-fatal and return neutral `SubScore(score=50, skipped=True)`.
 4. **Context builder** — Fetches quote, greeks, news, insider/congressional trades from the Unusual Whales API (concurrent, with graceful degradation on partial failures).
 5. **Prompt assembly** — Renders system + user prompts from `GradingContext`, including the `GradeResponse` JSON schema.
-6. **LLM call** — Sends to Claude (default: `claude-sonnet-4-20250514`) with a 512-token limit.
+6. **LLM call (main grader)** — Sends to Claude (default: `claude-sonnet-4-20250514`) with the grader `max_tokens` (default 512).
 7. **Parse & validate** — Strips markdown fences, extracts JSON, validates with Pydantic. On parse failure, retries once.
 8. **Audit** — Writes every grading decision to the `grades` table in `data/trades.db`.
 9. **Routing** — If score >= `score_threshold` (default 70), emits a `ScoredTrade` to the scored queue; otherwise returns `None`.
@@ -267,6 +268,57 @@ The sentiment analyst is a crowd/noise filter, not a "bullish news" engine. Core
 - Gate 3 orchestrator: `src/grader/gate3.py`
 
 Any source failure degrades gracefully to neutral defaults; sentiment never blocks the rest of the pipeline.
+
+---
+
+## Insider Tracker (Gate 3)
+
+The **Insider Tracker** answers whether corporate insiders and congressional holders are aligned with the unusual options flow. It is LLM-powered (same Claude model family as the rest of the grader) and runs **in parallel** with the sentiment and sector agents (`src/grader/gate3.py`).
+
+### Data sources (API call budget)
+
+All sources are fetched concurrently (`asyncio.gather(return_exceptions=True)`); failures are logged and treated as empty data.
+
+| Tier | Source | Endpoints / usage |
+|------|--------|---------------------|
+| UW insider | Primary | `GET /api/insider/{ticker}`, `GET /api/stock/{ticker}/insider-buy-sells`, `GET /api/insider/{ticker}/ticker-flow` |
+| UW congressional | Primary | `GET /api/politician-portfolios/holders/{ticker}`, `GET /api/congress/recent-trades` (filtered to ticker client-side) |
+| Finnhub | Cross-reference / MSPR | `GET /api/v1/stock/insider-transactions`, `GET /api/v1/stock/insider-sentiment` (optional; `401`/`403` → no MSPR) |
+
+Implementation uses **`shared/finnhub_client.py`** (async HTTP to Finnhub REST) and **`src/grader/context/insider_ctx.py`** for normalization, deterministic **cluster detection** (2+ distinct insiders, same buy/sell direction, within `InsiderScoringConfig.cluster_window_days`), **UW vs Finnhub direction** cross-check, and **merge/dedup** of overlapping filings between UW and Finnhub.
+
+### Skip behavior
+
+If there is **no qualifying insider activity** in the configured lookback **and** no congressional holders or recent congressional trades in derived signals, the agent **does not call the LLM** and returns a neutral `SubScore` with `skipped=True`, `score=50`, and a short rationale (absence of data is not scored as bearish).
+
+### Confidence adjustment
+
+When fewer than `InsiderScoringConfig.min_sources_for_full_confidence` data sources are present, raw LLM scores are **compressed toward 50** so sparse-data extremes are not over-weighted.
+
+### Configuration
+
+Tuning lives in **`InsiderScoringConfig`** in `src/shared/filters.py` (cluster window, lookbacks, max rows in prompt, MSPR thresholds, etc.).
+
+### Runtime behavior
+
+- Context builder: `src/grader/context/insider_ctx.py`
+- Agent: `src/grader/agents/insider_tracker.py`
+- Prompts: `INSIDER_TRACKER_*` in `src/grader/prompt.py`
+- Tests: `tests/test_insider_tracker.py`, fixtures in `tests/fixtures/insider_fixtures.py`
+
+### Insider Tracker token budget
+
+Approximate Claude usage **for this agent only** (per candidate that actually calls the LLM; skipped candidates use **no** insider LLM tokens):
+
+| Component | Tokens (approx.) |
+|-----------|------------------|
+| System prompt | ~350 |
+| User prompt (typical) | ~400–700 |
+| User prompt (data-rich ticker) | ~1,000 |
+| Response (`max_tokens=300`) | ~150–200 |
+| **Total per graded candidate** | **~900–1,500** |
+
+Rough cost order-of-magnitude (same model/pricing as the main grader): **~$0.002–0.004** per insider call when the pipeline is configured for Sonnet-class pricing; the user prompt is capped at **20** merged insider rows (`InsiderScoringConfig.max_transactions_in_prompt`) to keep context bounded.
 
 ---
 
@@ -416,7 +468,7 @@ jq -s 'map(select(.event == "cycle_complete") | .duration_ms) | add / length' sc
 
 ```
 whale-scanner/
-├── .env.example                  # Template for secrets (UW_API_TOKEN, ANTHROPIC_API_KEY)
+├── .env.example                  # Template for secrets (UW_API_TOKEN, ANTHROPIC_API_KEY, FINNHUB_API_KEY)
 ├── .gitignore
 ├── .github/workflows/test.yml    # CI: pytest on push/PR
 ├── pyproject.toml                # Project metadata + dependencies
@@ -431,8 +483,9 @@ whale-scanner/
 ├── src/
 │   ├── shared/                   # Cross-agent code
 │   │   ├── __init__.py
-│   │   ├── filters.py            # Gate thresholds, scoring weights, ticker exclusions
+│   │   ├── filters.py            # Gate thresholds, InsiderScoringConfig, ticker exclusions
 │   │   ├── models.py             # Candidate, SignalMatch, FlowCandidate, SubScore
+│   │   ├── finnhub_client.py     # Async Finnhub REST (insider transactions + MSPR)
 │   │   ├── db.py                 # SQLite connection + grades/scans/executions/flow_scores tables
 │   │   └── config.py             # YAML loader + env injection
 │   ├── scanner/
@@ -465,18 +518,23 @@ whale-scanner/
 │       ├── main.py               # Consumer loop: candidate_queue → scored_queue
 │       ├── gate1.py              # Gate 1: deterministic flow analyst + SQLite logging
 │       ├── gate2.py              # Gate 2: deterministic volatility + risk (parallel) + threshold
+│       ├── gate3.py              # Gate 3: sentiment + insider + sector SubScores in parallel
 │       ├── grader.py             # Orchestrator (context → LLM → parse → log)
 │       ├── context/
 │       │   ├── __init__.py
 │       │   ├── sector_cache.py   # Daily-refresh market/sector vol benchmarks (in-memory)
 │       │   ├── vol_ctx.py        # Normalized volatility context builder for scoring
-│       │   └── risk_ctx.py       # Risk analyst context fetcher (option chains, vol stats, earnings)
+│       │   ├── risk_ctx.py       # Risk analyst context fetcher (option chains, vol stats, earnings)
+│       │   ├── sentiment_ctx.py  # Gate 3 sentiment context (UW + Finnhub + Reddit)
+│       │   └── insider_ctx.py    # Gate 3 insider + congressional + Finnhub context
 │       ├── context_builder.py    # Enriches Candidate with quote, greeks, news, insider
 │       ├── agents/
 │       │   ├── __init__.py
 │       │   ├── flow_analyst.py        # Deterministic Gate 1 scoring engine
 │       │   ├── volatility_analyst.py  # Deterministic Gate 2 volatility scorer (4 UW endpoints)
-│       │   └── risk_analyst.py        # Deterministic Gate 2 risk conviction scorer
+│       │   ├── risk_analyst.py        # Deterministic Gate 2 risk conviction scorer
+│       │   ├── sentiment_analyst.py   # Gate 3 LLM sentiment / crowding
+│       │   └── insider_tracker.py     # Gate 3 LLM insider + congressional alignment
 │       ├── prompt.py             # System + user prompt templates
 │       ├── llm_client.py         # Anthropic SDK wrapper
 │       ├── parser.py             # JSON extract + GradeResponse validation
@@ -498,6 +556,9 @@ whale-scanner/
 │   ├── test_flow_analyst.py
 │   ├── test_vol_analyst.py
 │   ├── test_risk_analyst.py
+│   ├── test_sentiment_analyst.py
+│   ├── test_sentiment_ctx.py
+│   ├── test_insider_tracker.py
 │   └── test_grader.py
 ├── scripts/
 │   ├── backfill.py

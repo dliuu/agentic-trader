@@ -49,13 +49,16 @@ class LLMClient:
         self._model = model
         self._max_tokens = max_tokens
 
-    async def complete(self, system: str, user: str) -> LLMResponse:
+    async def complete(
+        self, system: str, user: str, max_tokens: int | None = None
+    ) -> LLMResponse:
         """Send a single completion request. Returns structured response."""
         start = time.monotonic()
+        mt = self._max_tokens if max_tokens is None else max_tokens
 
         response = await self._client.messages.create(
             model=self._model,
-            max_tokens=self._max_tokens,
+            max_tokens=mt,
             temperature=0,
             system=system,
             messages=[{"role": "user", "content": user}],
