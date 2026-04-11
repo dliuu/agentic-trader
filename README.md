@@ -3,11 +3,12 @@
 A multi-gate pipeline for unusual options flow:
 
 - **Agent A (Scanner)** — Deterministic rule engine that scans for unusual options flow during US market hours. Polls the [Unusual Whales](https://unusualwhales.com) API, applies configurable filters, scores candidates by multi-signal confluence, and pushes them to the grader.
+- **Gate 0 (Ticker universe)** — Hard pre-filter before Gate 1: static block lists (mega-caps, meme names, China ADRs, plus the same ETF/index exclusions used downstream) and one cached UW `/api/stock/{ticker}/info` call for market cap ($250M–$20B) and `issue_type` (common stock only). API failures **fail open**; static matches **fail closed**. Optional allow list via `GATE0_ALLOW_LIST` (see [Gate 0 and the interesting universe](#gate-0-and-the-interesting-universe)).
 - **Gate 1 (Flow Analyst)** — Deterministic post-scanner filter (no LLM, no external API calls). Scores each candidate 1–100 from the in-memory `Candidate` object only, logs every decision to SQLite, and discards candidates below threshold before any LLM tokens are spent.
 - **Gate 2 (Volatility Analyst + Risk Analyst)** — Deterministic “is the buyer getting a good deal?” layer. The **Volatility Analyst** fetches 4 UW volatility/chain endpoints per candidate (no LLM), and the **Risk Analyst** scores structural conviction from buyer risk accepted (premium, DTE, spread, OTM distance, move ratio, liquidity, earnings proximity). Gate 2 passes when the average of (flow + vol + risk) meets the configured threshold.
 - **Gate 3 (Specialists + synthesis)** — Runs **Sentiment Analyst**, **Insider Tracker**, and a deterministic **Sector Analyst** in parallel (each emits a `SubScore`). Those scores are merged with Gate 1–2 sub-scores into a **deterministic aggregator** (weighted average, disagreement, six conflict detectors). A final **Synthesis** step makes **one** Claude call to produce the 1–100 score, applies deterministic caps, merges position sizing with the risk analyst, and emits a passing `ScoredTrade` if the score meets the threshold. See [Synthesis layer (Gate 3)](#synthesis-layer-gate-3) and the specialist sections below.
 
-**Key features:** Confluence enrichment (dark pool + market tide), deterministic Gates 1–2 before most LLM spend, Gate 3 uses three specialist calls plus one synthesis call (not the legacy single-shot context grader in production), `--force` to bypass market hours, `--max-cycles` for limited runs, dual logging (terminal + `scanner.json.log`), grader pass-through mode (`grader.enabled: false`), and audit logging to SQLite (`flow_scores` + `grades`).
+**Key features:** Confluence enrichment (dark pool + market tide), **Gate 0** universe filter (static lists + cached UW stock info), deterministic Gates 1–2 before most LLM spend, Gate 3 uses three specialist calls plus one synthesis call (not the legacy single-shot context grader in production), optional `GATE0_ALLOW_LIST` for a focused ticker set, `--force` to bypass market hours, `--max-cycles` for limited runs, dual logging (terminal + `scanner.json.log`), grader pass-through mode (`grader.enabled: false`), and audit logging to SQLite (`flow_scores` + `grades`).
 
 ### Quick run (full pipeline)
 
@@ -36,6 +37,7 @@ See [Getting Started](#getting-started) for venv setup, `.env`, and all run mode
 - [End-to-End Flow Summary](#end-to-end-flow-summary)
 - [How the Scanner Works](#how-the-scanner-works)
 - [Sector Benchmark Cache (Market/Sector Vol Benchmarks)](#sector-benchmark-cache-marketsector-vol-benchmarks)
+- [Gate 0 and the interesting universe](#gate-0-and-the-interesting-universe)
 - [How the Grader Works](#how-the-grader-works)
 - [Synthesis layer (Gate 3)](#synthesis-layer-gate-3)
 - [Sentiment Analyst (Gate 3)](#sentiment-analyst-gate-3)
@@ -104,6 +106,9 @@ Edit `.env` and set:
 UW_API_TOKEN=your_unusual_whales_token
 ANTHROPIC_API_KEY=your_anthropic_api_key
 FINNHUB_API_KEY=your_finnhub_api_key_here
+
+# Optional: restrict Gate 0 to these tickers (comma-separated). ETFs in EXCLUDED_TICKERS still blocked.
+# GATE0_ALLOW_LIST=ACME,XYZ
 ```
 
 ### Step 4: Run the pipeline
@@ -143,10 +148,10 @@ Press **`Ctrl+C`** in the terminal to interrupt the process.
 │                     Full Pipeline (run_pipeline)                      │
 │                                                                       │
 │  ┌─────────────────────────────────────┐  ┌────────────────────────┐ │
-│  │         Agent A (Scanner)            │  │ Gate 1 (Flow Analyst)   │ │
+│  │         Agent A (Scanner)            │  │ Gate 0 → Gate 1         │ │
 │  │                                      │  │                         │ │
-│  │  Market Clock → UW API → Dedup       │  │  Candidate Queue        │ │
-│  │       → Rule Engine → Confluence     │──▶│       → Score + Log     │ │
+│  │  Market Clock → UW API → Dedup       │  │  Queue → Universe +     │ │
+│  │       → Rule Engine → Confluence     │──▶│  flow score + log       │ │
 │  │       → SQLite + Queue               │  │       → Pass/Reject     │ │
 │  └─────────────────────────────────────┘  └───────────┬────────────┘ │
 │                                                       │              │
@@ -175,7 +180,7 @@ Press **`Ctrl+C`** in the terminal to interrupt the process.
 └───────────────────────────────────────────────────────────────────────┘
 ```
 
-The scanner runs as an async producer: every cycle it fetches flow alerts, dark pool prints, and market tide from the Unusual Whales API, deduplicates, runs the rule engine, enriches with confluence data, persists to SQLite, and pushes candidates into a shared queue. The grader consumer runs Gates 1–3: deterministic flow, then vol + risk, then parallel specialists, deterministic aggregation, and a single synthesis LLM call (when grading is enabled). Shared code lives in `src/shared/` (models, config, db, filters).
+The scanner runs as an async producer: every cycle it fetches flow alerts, dark pool prints, and market tide from the Unusual Whales API, deduplicates, runs the rule engine, enriches with confluence data, persists to SQLite, and pushes candidates into a shared queue. The grader consumer runs **Gate 0** (universe filter), then **Gates 1–3**: deterministic flow, then vol + risk, then parallel specialists, deterministic aggregation, and a single synthesis LLM call (when grading is enabled). Shared code lives in `src/shared/` (models, config, db, filters).
 
 ---
 
@@ -185,11 +190,12 @@ At a high level, the pipeline is:
 
 1. **Scanner (Agent A)** polls the Unusual Whales API for raw flow and confluence signals, deduplicates, applies the rule engine, and emits `Candidate` objects.
 2. **Sector Benchmark Cache** (daily-refresh, in-memory) fetches market/sector volatility benchmarks used for "cheap vs market/sector" context. This cache is designed to be warmed once per trading day and reused across all candidates graded that day.
-3. **Filter agent (Gate 1 Flow Analyst)** deterministically scores each `Candidate` from in-memory fields only (no LLM, no external API calls) and rejects low-quality candidates before any token spend.
-4. **Gate 2 (Volatility Analyst + Risk Analyst)** runs in parallel and determines whether the buyer is paying fair implied volatility relative to the ticker’s own history, sector peers, and the broader market. Gate 2 is deterministic and designed to be low-latency.
-5. **Gate 3** runs three specialists in parallel (**Sentiment**, **Insider**, **Sector**), each producing a `SubScore` (failures become skipped neutral scores so the pipeline continues). Insider Tracker may skip its LLM when there is no qualifying data (see [Insider Tracker (Gate 3)](#insider-tracker-gate-3)).
-6. **Aggregation + synthesis** (when `grader.enabled` is true) merges all six sub-scores (flow, vol, risk, sentiment, insider, sector), computes a renormalized weighted average, population stdev, agreement label, and conflict flags (`grader.aggregator`). **Synthesis** (`grader.synthesis`) builds a dedicated prompt (`grader.synthesis_prompt`), calls Claude once, parses JSON, applies deterministic score caps, sets verdict from the final score (≥70 pass), sets `TradeRiskParams.recommended_position_size` to `min(LLM modifier, risk analyst size)`, logs every outcome to `grades` in `data/trades.db`, and enqueues a `ScoredTrade` only if the final score ≥ `grader.score_threshold`.
-7. **Legacy `Grader` class** (`grader.grader`) — older single-shot “context builder → one LLM” path kept for unit tests; **production** `grader.main` uses `run_gate3` + `SynthesisAgent` instead.
+3. **Gate 0 (universe filter)** runs first in the grader: static lists plus optional UW stock info for market cap and issue type (see [Gate 0 and the interesting universe](#gate-0-and-the-interesting-universe)).
+4. **Filter agent (Gate 1 Flow Analyst)** deterministically scores each `Candidate` from in-memory fields only (no LLM, no external API calls) and rejects low-quality candidates before any token spend.
+5. **Gate 2 (Volatility Analyst + Risk Analyst)** runs in parallel and determines whether the buyer is paying fair implied volatility relative to the ticker’s own history, sector peers, and the broader market. Gate 2 is deterministic and designed to be low-latency.
+6. **Gate 3** runs three specialists in parallel (**Sentiment**, **Insider**, **Sector**), each producing a `SubScore` (failures become skipped neutral scores so the pipeline continues). Insider Tracker may skip its LLM when there is no qualifying data (see [Insider Tracker (Gate 3)](#insider-tracker-gate-3)).
+7. **Aggregation + synthesis** (when `grader.enabled` is true) merges all six sub-scores (flow, vol, risk, sentiment, insider, sector), computes a renormalized weighted average, population stdev, agreement label, and conflict flags (`grader.aggregator`). **Synthesis** (`grader.synthesis`) builds a dedicated prompt (`grader.synthesis_prompt`), calls Claude once, parses JSON, applies deterministic score caps, sets verdict from the final score (≥70 pass), sets `TradeRiskParams.recommended_position_size` to `min(LLM modifier, risk analyst size)`, logs every outcome to `grades` in `data/trades.db`, and enqueues a `ScoredTrade` only if the final score ≥ `grader.score_threshold`.
+8. **Legacy `Grader` class** (`grader.grader`) — older single-shot “context builder → one LLM” path kept for unit tests; **production** `grader.main` uses `run_gate3` + `SynthesisAgent` instead.
 
 ---
 
@@ -257,19 +263,31 @@ async def example(api_token: str) -> None:
 
 ---
 
+## Gate 0 and the interesting universe
+
+**Interesting universe** means: **US common stocks** where unusual options flow is more likely to reflect **stock-specific information** than **index/ETF hedging**, **mega-cap noise**, **retail/meme crowding**, or **China ADR / non-equity structures**. Concretely, after static lists, a symbol must show UW `issue_type` **Common Stock** and **market capitalization between $250M and $20B** (inclusive). Below the floor, listed options are often too thin to trade; above the ceiling, flow is dominated by hedging and macro. Symbols on hard-coded mega-cap, meme, and China ADR lists are dropped without relying on the API.
+
+**Allow list (`GATE0_ALLOW_LIST`)** — Comma-separated tickers in the environment (e.g. `ACME,BRK.B`). When set, **only** those symbols are eligible for Gate 0's **dynamic** checks (market cap and issue type). They are **not** exempt from `EXCLUDED_TICKERS`: e.g. `SPY` in the allow list is still blocked as an ETF. You can also set `shared.filters.ALLOW_LIST` in code or tests. Empty allow list = no extra restriction (default).
+
+Implementation: `src/grader/gate0.py` (`run_gate0`), lists and `is_universe_blocked()` in `src/shared/filters.py`. Structured logs: `gate0.*`, `pipeline.gate0_reject`.
+
+---
+
 ## How the Grader Works
 
-The grader runs as `grader.main.run_grader`: it drains the same `asyncio.Queue` the scanner fills. When `grader.enabled` is **true** (default), each candidate goes through Gates 1 → 2 → 3 (specialists + synthesis). When **false**, only Gate 1 runs and survivors are forwarded with `grade=None` (pass-through).
+The grader runs as `grader.main.run_grader`: it drains the same `asyncio.Queue` the scanner fills. When `grader.enabled` is **true** (default), each candidate goes through **Gate 0** → Gates 1 → 2 → 3 (specialists + synthesis). When **false**, **Gate 0 and Gate 1** still run; survivors are forwarded with `grade=None` (pass-through).
 
-1. **Gate 1 (flow analyst, deterministic)** — Converts `Candidate` → `FlowCandidate`, applies exclusions and flow scoring from `shared.filters`, logs to `flow_scores`. Below `GATE_THRESHOLDS.flow_analyst_min` → discard.
+1. **Gate 0 (universe filter)** — Static block lists (`is_universe_blocked`) then optional cached `GET /api/stock/{ticker}/info` for market cap and issue type. UW errors → **fail open** (candidate continues); static hits → **fail closed**.
 
-2. **Gate 2 (volatility + risk, deterministic)** — Volatility analyst (UW vol/chain context) and **RiskConvictionScore** from the risk analyst run in parallel. Short-circuit if untradeable / zero position size. Otherwise pass if mean(flow, vol, risk) ≥ `GATE_THRESHOLDS.deterministic_avg_min` (same spirit as `gate2_avg_threshold` in config comments).
+2. **Gate 1 (flow analyst, deterministic)** — Converts `Candidate` → `FlowCandidate`, applies exclusions and flow scoring from `shared.filters`, logs to `flow_scores`. Below `GATE_THRESHOLDS.flow_analyst_min` → discard.
 
-3. **Gate 3 (`run_gate3` in `grader.gate3`)** — Runs sentiment, insider, and sector `score()` coroutines in parallel. Exceptions → skipped `SubScore(score=50)`. Builds the six-agent map, runs **`Aggregator`**, then **`SynthesisAgent.synthesize`**. Successful synthesis always writes a row to **`grades`**; a **`ScoredTrade`** is pushed to the scored queue only if final score ≥ `grader.score_threshold`.
+3. **Gate 2 (volatility + risk, deterministic)** — Volatility analyst (UW vol/chain context) and **RiskConvictionScore** from the risk analyst run in parallel. Short-circuit if untradeable / zero position size. Otherwise pass if mean(flow, vol, risk) ≥ `GATE_THRESHOLDS.deterministic_avg_min` (same spirit as `gate2_avg_threshold` in config comments).
 
-4. **Legacy path** — `grader.grader.Grader` + `context_builder` + `build_user_prompt`/`parse_grade_response` remains for tests; it is **not** used by `run_grader` today.
+4. **Gate 3 (`run_gate3` in `grader.gate3`)** — Runs sentiment, insider, and sector `score()` coroutines in parallel. Exceptions → skipped `SubScore(score=50)`. Builds the six-agent map, runs **`Aggregator`**, then **`SynthesisAgent.synthesize`**. Successful synthesis always writes a row to **`grades`**; a **`ScoredTrade`** is pushed to the scored queue only if final score ≥ `grader.score_threshold`.
 
-With `grader.enabled: false`, the pipeline applies **Gate 1 only** and forwards survivors as `ScoredTrade` with `grade=None` and `risk=None` (no Gate 2, Gate 3, or LLM calls).
+5. **Legacy path** — `grader.grader.Grader` + `context_builder` + `build_user_prompt`/`parse_grade_response` remains for tests; it is **not** used by `run_grader` today.
+
+With `grader.enabled: false`, the pipeline applies **Gate 0 + Gate 1** and forwards survivors as `ScoredTrade` with `grade=None` and `risk=None` (no Gate 2, Gate 3, or LLM calls).
 
 ---
 
@@ -608,6 +626,7 @@ whale-scanner/
 │   └── grader/
 │       ├── __init__.py
 │       ├── main.py               # Consumer loop: candidate_queue → scored_queue
+│       ├── gate0.py              # Gate 0: ticker universe (static lists + UW stock info)
 │       ├── gate1.py              # Gate 1: deterministic flow analyst + SQLite logging
 │       ├── gate2.py              # Gate 2: deterministic volatility + risk (parallel) + threshold
 │       ├── gate3.py              # Gate 3: specialists ∥ → Aggregator → SynthesisAgent → threshold
@@ -699,7 +718,7 @@ Defined in `shared/models.py`. The output model emitted from scanner to grader:
 
 ### ScoredTrade, GradeResponse, and TradeRiskParams
 
-Defined in `grader/models.py`. A **`ScoredTrade`** is emitted when the final synthesis score ≥ `grader.score_threshold` (or in pass-through mode when Gate 1 alone runs). It includes:
+Defined in `grader/models.py`. A **`ScoredTrade`** is emitted when the final synthesis score ≥ `grader.score_threshold` (or in pass-through mode when Gate 0 + Gate 1 run). It includes:
 
 - **`Candidate`** — original scanner payload.
 - **`grade`** — `GradeResponse`: score 1–100, `verdict` (`pass` if score ≥ 70 after caps), `rationale`, `signals_confirmed`, optional synthesis fields (`confidence`, `conflict_resolution`, `key_signal`, `position_size_modifier`). In pass-through mode, `grade` is `None`.
@@ -787,7 +806,7 @@ The `DedupCache` prevents the same trade from being flagged across consecutive p
 
 ## Configuration Reference
 
-Scanner rule thresholds live in `config/rules.yaml`. Deterministic grading tunables (ticker exclusions, Gate 1 thresholds, and scoring weights) live in `src/shared/filters.py` as the single source of truth for the grading pipeline.
+Scanner rule thresholds live in `config/rules.yaml`. Deterministic grading tunables (ticker exclusions, Gate 0 block lists and `UniverseConfig`, Gate 1 thresholds, and scoring weights) live in `src/shared/filters.py` as the single source of truth for the grading pipeline. Optional environment variable **`GATE0_ALLOW_LIST`** (comma-separated tickers) seeds `ALLOW_LIST` at import for a restricted universe.
 
 ### Polling
 
@@ -891,11 +910,14 @@ python -m pytest tests/test_grader.py tests/test_grader_models.py tests/test_con
 
 # Deterministic risk analyst suite
 python -m pytest tests/test_risk_analyst.py -v --tb=short
+
+# Gate 0 universe filter
+python -m pytest tests/test_gate0.py -v --tb=short
 ```
 
 Ensure the venv is activated and the project is installed (`pip install -e ".[dev,grader]"`). Pytest is configured with `pythonpath = ["."]` in `pyproject.toml` so imports like `tests.fixtures.*` resolve when running from the repo root.
 
-Notable suites: `tests/test_sector_cache.py`, `tests/test_vol_analyst.py`, `tests/test_risk_analyst.py`, `tests/test_sector_analyst.py`, `tests/test_sentiment_analyst.py`, `tests/test_insider_tracker.py`, `tests/test_flow_analyst.py`.
+Notable suites: `tests/test_gate0.py`, `tests/test_sector_cache.py`, `tests/test_vol_analyst.py`, `tests/test_risk_analyst.py`, `tests/test_sector_analyst.py`, `tests/test_sentiment_analyst.py`, `tests/test_insider_tracker.py`, `tests/test_flow_analyst.py`.
 
 If your default `python` is not 3.11+, run tests with `python3.11 -m pytest ...` (project requires Python 3.11+).
 

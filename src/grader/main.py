@@ -14,6 +14,7 @@ from grader.agents.insider_tracker import InsiderTracker
 from grader.agents.sector_analyst import SectorAnalyst
 from grader.agents.sentiment_analyst import SentimentAnalyst
 from grader.context.sentiment_ctx import SentimentContextBuilder
+from grader.gate0 import run_gate0
 from grader.gate1 import run_gate1
 from grader.gate2 import run_gate2
 from grader.gate3 import run_gate3
@@ -90,6 +91,16 @@ async def run_grader(
 
             if candidate is None:
                 break
+
+            gate0_result = await run_gate0(candidate, http_client, config["uw_api_token"])
+            if not gate0_result.passed:
+                log.info(
+                    "pipeline.gate0_reject",
+                    ticker=candidate.ticker,
+                    reason=gate0_result.reason.value if gate0_result.reason else "unknown",
+                )
+                candidate_queue.task_done()
+                continue
 
             passed_gate1, flow_score = await run_gate1(candidate)
             if not passed_gate1:

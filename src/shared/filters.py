@@ -8,6 +8,7 @@ references a constant from here.
 To tune the system, edit ONLY this file.
 """
 
+import os
 from dataclasses import dataclass
 from enum import Enum
 
@@ -26,6 +27,11 @@ class TickerExclusionReason(str, Enum):
     INVERSE_ETF = "inverse_etf"
     VIX_PRODUCT = "vix_product"
     PENNY_STOCK = "penny_stock"
+    MEGA_CAP = "mega_cap"
+    MEME_STOCK = "meme_stock"
+    CHINA_ADR = "china_adr"
+    MARKET_CAP_OUT_OF_RANGE = "market_cap_out_of_range"
+    NON_COMMON_STOCK = "non_common_stock"
 
 
 # NOTE: The UW /api/option-trades/flow-alerts endpoint does NOT support
@@ -121,11 +127,140 @@ EXCLUDED_TICKERS: dict[str, TickerExclusionReason] = {
 }
 
 
+BLOCKED_MEGA_CAPS: dict[str, TickerExclusionReason] = {
+    "AAPL": TickerExclusionReason.MEGA_CAP,
+    "MSFT": TickerExclusionReason.MEGA_CAP,
+    "GOOGL": TickerExclusionReason.MEGA_CAP,
+    "GOOG": TickerExclusionReason.MEGA_CAP,
+    "AMZN": TickerExclusionReason.MEGA_CAP,
+    "META": TickerExclusionReason.MEGA_CAP,
+    "TSLA": TickerExclusionReason.MEGA_CAP,
+    "NVDA": TickerExclusionReason.MEGA_CAP,
+    "BRK.B": TickerExclusionReason.MEGA_CAP,
+    "JPM": TickerExclusionReason.MEGA_CAP,
+    "V": TickerExclusionReason.MEGA_CAP,
+    "MA": TickerExclusionReason.MEGA_CAP,
+    "UNH": TickerExclusionReason.MEGA_CAP,
+    "JNJ": TickerExclusionReason.MEGA_CAP,
+    "WMT": TickerExclusionReason.MEGA_CAP,
+    "PG": TickerExclusionReason.MEGA_CAP,
+    "HD": TickerExclusionReason.MEGA_CAP,
+    "BAC": TickerExclusionReason.MEGA_CAP,
+    "XOM": TickerExclusionReason.MEGA_CAP,
+    "CVX": TickerExclusionReason.MEGA_CAP,
+    "LLY": TickerExclusionReason.MEGA_CAP,
+    "ABBV": TickerExclusionReason.MEGA_CAP,
+    "AVGO": TickerExclusionReason.MEGA_CAP,
+    "MRK": TickerExclusionReason.MEGA_CAP,
+    "COST": TickerExclusionReason.MEGA_CAP,
+    "PEP": TickerExclusionReason.MEGA_CAP,
+    "KO": TickerExclusionReason.MEGA_CAP,
+    "ORCL": TickerExclusionReason.MEGA_CAP,
+    "TMO": TickerExclusionReason.MEGA_CAP,
+    "CRM": TickerExclusionReason.MEGA_CAP,
+}
+
+BLOCKED_MEME_TICKERS: dict[str, TickerExclusionReason] = {
+    "GME": TickerExclusionReason.MEME_STOCK,
+    "AMC": TickerExclusionReason.MEME_STOCK,
+    "PLTR": TickerExclusionReason.MEME_STOCK,
+    "RIVN": TickerExclusionReason.MEME_STOCK,
+    "LCID": TickerExclusionReason.MEME_STOCK,
+    "SOFI": TickerExclusionReason.MEME_STOCK,
+    "HOOD": TickerExclusionReason.MEME_STOCK,
+    "MARA": TickerExclusionReason.MEME_STOCK,
+    "RIOT": TickerExclusionReason.MEME_STOCK,
+    "COIN": TickerExclusionReason.MEME_STOCK,
+    "MSTR": TickerExclusionReason.MEME_STOCK,
+    "RKLB": TickerExclusionReason.MEME_STOCK,
+    "IONQ": TickerExclusionReason.MEME_STOCK,
+    "SMCI": TickerExclusionReason.MEME_STOCK,
+    "RDDT": TickerExclusionReason.MEME_STOCK,
+    "AFRM": TickerExclusionReason.MEME_STOCK,
+}
+
+BLOCKED_CHINA_ADRS: dict[str, TickerExclusionReason] = {
+    "BABA": TickerExclusionReason.CHINA_ADR,
+    "PDD": TickerExclusionReason.CHINA_ADR,
+    "JD": TickerExclusionReason.CHINA_ADR,
+    "BIDU": TickerExclusionReason.CHINA_ADR,
+    "NIO": TickerExclusionReason.CHINA_ADR,
+    "XPEV": TickerExclusionReason.CHINA_ADR,
+    "LI": TickerExclusionReason.CHINA_ADR,
+    "TME": TickerExclusionReason.CHINA_ADR,
+    "BILI": TickerExclusionReason.CHINA_ADR,
+    "ZTO": TickerExclusionReason.CHINA_ADR,
+    "VNET": TickerExclusionReason.CHINA_ADR,
+}
+
+
+def _gate0_allow_list_from_env() -> set[str]:
+    """Comma-separated tickers from GATE0_ALLOW_LIST (uppercased). Empty = no restriction."""
+    raw = os.environ.get("GATE0_ALLOW_LIST", "").strip()
+    if not raw:
+        return set()
+    return {t.strip().upper() for t in raw.split(",") if t.strip()}
+
+
+# If non-empty, a ticker must appear here to be eligible for Gate 0's dynamic checks.
+# EXCLUDED_TICKERS (ETFs, index products, etc.) still apply after this filter.
+# Set via env GATE0_ALLOW_LIST or assign/monkeypatch ``ALLOW_LIST`` in code/tests.
+ALLOW_LIST: set[str] = _gate0_allow_list_from_env()
+
+
+@dataclass(frozen=True)
+class UniverseConfig:
+    """Market cap and issue-type thresholds for Gate 0 universe filter.
+
+    The UW /api/stock/{ticker}/info endpoint returns:
+      - "marketCap": int (e.g. 5000000000)
+      - "issue_type": str (e.g. "Common Stock", "ETF", "ADR")
+
+    Only tickers with issue_type == "Common Stock" AND market cap within
+    the allowed range pass Gate 0.
+    """
+
+    min_market_cap: float = 250_000_000  # $250M floor — below this, chains too thin to exit
+    max_market_cap: float = 20_000_000_000  # $20B ceiling — above this, too much hedging noise
+    cache_ttl_seconds: int = 86400  # 24h cache for /stock/{ticker}/info responses
+
+    # Allowed issue types from UW /api/stock/{ticker}/info
+    # Only these pass; everything else (ETF, ADR, Warrant, etc.) is blocked.
+    allowed_issue_types: tuple[str, ...] = ("Common Stock",)
+
+
+UNIVERSE_CONFIG = UniverseConfig()
+
+
 def is_excluded_ticker(ticker: str) -> tuple[bool, TickerExclusionReason | None]:
     """Check if a ticker should be excluded from grading.
     Returns (is_excluded, reason)."""
     reason = EXCLUDED_TICKERS.get(ticker.upper())
     return (reason is not None, reason)
+
+
+def is_universe_blocked(ticker: str) -> tuple[bool, TickerExclusionReason | None]:
+    """Check if a ticker is blocked by Gate 0 static lists.
+
+    If ``ALLOW_LIST`` is non-empty, only tickers in that set proceed to the
+    shared static block lists; tickers not on the list are blocked.
+    ``EXCLUDED_TICKERS`` (ETFs, etc.) still block symbols that appear on the
+    allow list (e.g. SPY).
+
+    Returns (is_blocked, reason). Does NOT check market cap (that requires
+    an API call and is handled by the Gate 0 async filter).
+    """
+    upper = ticker.upper()
+
+    if ALLOW_LIST and upper not in ALLOW_LIST:
+        return True, TickerExclusionReason.MARKET_CAP_OUT_OF_RANGE
+
+    for block_list in (EXCLUDED_TICKERS, BLOCKED_MEGA_CAPS, BLOCKED_MEME_TICKERS, BLOCKED_CHINA_ADRS):
+        reason = block_list.get(upper)
+        if reason is not None:
+            return True, reason
+
+    return False, None
 
 
 # ──────────────────────────────────────────────
