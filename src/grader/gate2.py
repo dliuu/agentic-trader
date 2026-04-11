@@ -42,7 +42,7 @@ async def run_gate2(
 
     flow_candidate = candidate_to_flow(candidate)
 
-    risk_ctx_task = fetch_risk_context(flow_candidate, client)
+    risk_ctx_task = fetch_risk_context(flow_candidate, client, api_token)
     vol_score_task = score_volatility(candidate, client, api_token, sector_cache)
     risk_ctx, vol_score = await asyncio.gather(risk_ctx_task, vol_score_task)
 

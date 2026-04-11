@@ -10,6 +10,9 @@ from typing import Any
 import httpx
 import structlog
 
+from shared.uw_http import uw_get
+from shared.uw_runtime import get_uw_limiter
+
 logger = structlog.get_logger()
 
 UW_BASE = "https://api.unusualwhales.com"
@@ -312,7 +315,13 @@ async def _get_json(
     }
     url = f"{UW_BASE}{path}" if path.startswith("/") else f"{UW_BASE}/{path}"
     try:
-        r = await client.get(url, headers=headers, params=params or {})
+        r = await uw_get(
+            client,
+            url,
+            limiter=get_uw_limiter(),
+            headers=headers,
+            params=params or {},
+        )
         r.raise_for_status()
         return r.json()
     except httpx.HTTPStatusError as e:

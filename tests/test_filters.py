@@ -1,3 +1,5 @@
+import datetime
+
 import pytest
 
 from scanner.models.flow_alert import FlowAlert
@@ -176,14 +178,18 @@ def test_volume_oi_ratio():
 # --- check_expiry ---
 
 
-def test_expiry_filter_triggers_in_range():
+def test_expiry_filter_triggers_in_range(monkeypatch):
     """DTE within [min_dte, max_dte] returns SignalMatch."""
+    monkeypatch.setattr(
+        "scanner.models.flow_alert._today_for_dte",
+        lambda: datetime.date(2026, 3, 21),
+    )
     alert = FlowAlert(
         id="exp-1",
         ticker="EXP",
         type="Calls",
         strike=100.0,
-        expiry="2026-04-03",  # ~13 DTE from 2026-03-21
+        expiry="2026-04-03",
         total_premium=50000.0,
         total_size=100,
         open_interest=50,

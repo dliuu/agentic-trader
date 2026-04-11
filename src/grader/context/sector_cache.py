@@ -11,12 +11,16 @@ from __future__ import annotations
 
 import asyncio
 import statistics
+import time
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 
 import httpx
 import structlog
+
+from shared.uw_http import uw_get_json
+from shared.uw_runtime import get_uw_limiter
 
 logger = structlog.get_logger()
 
@@ -125,7 +129,7 @@ def _unwrap_data(response: dict[str, Any]) -> dict[str, Any]:
 def _extract_iv_rank(iv_response: dict[str, Any]) -> float:
     """Extract IV rank (0-100) from /iv-rank response."""
     data = _unwrap_data(iv_response)
-    for field in ["iv_rank", "ivRank", "rank", "iv_percentile_rank"]:
+    for field in ["iv_rank", "iv_rank_1y", "ivRank", "rank", "iv_percentile_rank"]:
         val = data.get(field)
         if val is not None:
             if field != "iv_rank":
@@ -196,16 +200,24 @@ async def _fetch_ticker_vol(
     }
     base = "https://api.unusualwhales.com"
 
+    limiter = get_uw_limiter()
     try:
-        iv_resp, vol_resp = await asyncio.gather(
-            client.get(f"{base}/api/stock/{ticker}/iv-rank", headers=headers),
-            client.get(f"{base}/api/stock/{ticker}/volatility/stats", headers=headers),
+        iv_data, vol_data = await asyncio.gather(
+            uw_get_json(
+                client,
+                f"{base}/api/stock/{ticker}/iv-rank",
+                headers=headers,
+                limiter=limiter,
+                cache_key=f"uw:iv-rank:{ticker}",
+            ),
+            uw_get_json(
+                client,
+                f"{base}/api/stock/{ticker}/volatility/stats",
+                headers=headers,
+                limiter=limiter,
+                cache_key=f"uw:vol-stats:{ticker}",
+            ),
         )
-        iv_resp.raise_for_status()
-        vol_resp.raise_for_status()
-
-        iv_data = iv_resp.json()
-        vol_data = vol_resp.json()
 
         iv_rank = _extract_iv_rank(iv_data)
         current_iv = _extract_current_iv(iv_data, vol_data)
@@ -249,7 +261,12 @@ def _compute_sector_benchmark(sector: str, snapshots: list[TickerVolSnapshot]) -
     )
 
 
-async def refresh_sector_cache(client: httpx.AsyncClient, api_token: str) -> SectorBenchmarkCache:
+async def refresh_sector_cache(
+    client: httpx.AsyncClient,
+    api_token: str,
+    *,
+    max_fetch_concurrency: int = 2,
+) -> SectorBenchmarkCache:
     """Fetch all benchmark tickers and build the cache."""
     ticker_total = sum(len(v) for v in BENCHMARK_TICKERS.values()) + 1
     logger.info("sector_cache.refresh_started", ticker_count=ticker_total)
@@ -263,7 +280,7 @@ async def refresh_sector_cache(client: httpx.AsyncClient, api_token: str) -> Sec
         client, MARKET_PROXY_TICKER, "_market", api_token
     )
 
-    semaphore = asyncio.Semaphore(10)
+    semaphore = asyncio.Semaphore(max(1, max_fetch_concurrency))
 
     async def _throttled(coro: asyncio.Future[TickerVolSnapshot | None]) -> TickerVolSnapshot | None:
         async with semaphore:
@@ -317,21 +334,37 @@ async def refresh_sector_cache(client: httpx.AsyncClient, api_token: str) -> Sec
 
 _cache: SectorBenchmarkCache | None = None
 _cache_lock = asyncio.Lock()
+_last_refresh_monotonic: float = 0.0
 
 
 async def get_sector_cache(
     client: httpx.AsyncClient,
     api_token: str,
     force_refresh: bool = False,
+    *,
+    min_refresh_interval_seconds: float = 8 * 3600,
+    max_fetch_concurrency: int = 2,
 ) -> SectorBenchmarkCache:
     """Get or refresh the sector cache. Thread-safe via asyncio lock.
 
-    Auto-refreshes if cache is None, stale, or force_refresh=True.
+    Refreshes when cache is missing, ``force_refresh``, older than
+    ``min_refresh_interval_seconds``, or ``is_stale`` (8h internal cap).
     """
-    global _cache
+    global _cache, _last_refresh_monotonic
     async with _cache_lock:
-        if _cache is None or _cache.is_stale or force_refresh:
-            _cache = await refresh_sector_cache(client, api_token)
+        now = time.monotonic()
+        need = (
+            force_refresh
+            or _cache is None
+            or (now - _last_refresh_monotonic) >= min_refresh_interval_seconds
+            or _cache.is_stale
+        )
+        if not need:
+            return _cache
+        _cache = await refresh_sector_cache(
+            client, api_token, max_fetch_concurrency=max_fetch_concurrency
+        )
+        _last_refresh_monotonic = now
         return _cache
 
 

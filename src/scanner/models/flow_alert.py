@@ -1,7 +1,13 @@
 from __future__ import annotations
 
+from datetime import date, datetime
+
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field, field_validator, model_validator
-from datetime import datetime
+
+
+def _today_for_dte() -> date:
+    """Wall-clock today for DTE; tests may monkeypatch this for determinism."""
+    return date.today()
 
 
 class FlowAlert(BaseModel):
@@ -56,11 +62,9 @@ class FlowAlert(BaseModel):
 
     @property
     def dte(self) -> int:
-        from datetime import date
-
         try:
             exp = date.fromisoformat(self.expiry)
-            return (exp - date.today()).days
+            return (exp - _today_for_dte()).days
         except (ValueError, TypeError):
             return -1
 

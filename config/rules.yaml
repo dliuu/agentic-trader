@@ -4,6 +4,16 @@ api:
   client_id: "100001"
   # API token loaded from .env, not stored here
 
+# Shared UW client behavior (scanner + grader). Token: UW_API_TOKEN or UNUSUAL_WHALES_API_TOKEN.
+unusual_whales:
+  rate_limit:
+    calls_per_minute: 45
+    burst: 10
+  iv_vol_cache_ttl_seconds: 90
+  sector_cache_refresh_seconds: 28800   # 8h — do not refresh benchmark basket every candidate
+  sector_fetch_concurrency: 2           # cap parallel benchmark ticker fetches
+  poll_backoff_max_multiplier: 4.0      # scanner widens interval when hitting 429s
+
 # Polling cadence
 polling:
   flow_alerts_interval_seconds: 30

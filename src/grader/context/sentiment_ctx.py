@@ -10,6 +10,8 @@ import httpx
 import structlog
 
 from grader.models import NewsBuzz, NewsHeadline, RedditPresence, RedditSummary, SentimentContext
+from shared.uw_http import uw_get
+from shared.uw_runtime import get_uw_limiter
 from shared.filters import SentimentConfig
 from shared.models import Candidate
 
@@ -91,8 +93,10 @@ class SentimentContextBuilder:
         )
 
     async def _fetch_uw_headlines(self, ticker: str) -> list[NewsHeadline]:
-        resp = await self._uw.get(
+        resp = await uw_get(
+            self._uw,
             "https://api.unusualwhales.com/api/news/headlines",
+            limiter=get_uw_limiter(),
             headers=self._uw_headers,
             params={"ticker": ticker, "limit": 20},
         )

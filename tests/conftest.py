@@ -5,6 +5,17 @@ from pathlib import Path
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def _reset_uw_runtime_between_tests():
+    from grader.context import sector_cache as sc
+    from shared.uw_runtime import reset_uw_runtime_for_tests
+
+    reset_uw_runtime_for_tests()
+    sc._cache = None  # type: ignore[attr-defined]
+    sc._last_refresh_monotonic = 0.0  # type: ignore[attr-defined]
+    yield
+
+
 @pytest.fixture
 def flow_fixture():
     fixture_path = Path(__file__).parent / "fixtures" / "flow_alerts_sample.json"

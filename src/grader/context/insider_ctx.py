@@ -13,6 +13,8 @@ import structlog
 from shared.finnhub_client import FinnhubClient
 from shared.filters import InsiderScoringConfig
 from shared.models import Candidate, SubScore
+from shared.uw_http import uw_get
+from shared.uw_runtime import get_uw_limiter
 
 log = structlog.get_logger()
 
@@ -520,7 +522,13 @@ def _compute_derived_signals(
 
 async def _fetch_uw_form4(client: httpx.AsyncClient, headers: dict[str, str], ticker: str) -> list[dict]:
     try:
-        resp = await client.get(f"{UW_BASE}/api/insider/{ticker}", headers=headers, timeout=15.0)
+        resp = await uw_get(
+            client,
+            f"{UW_BASE}/api/insider/{ticker}",
+            limiter=get_uw_limiter(),
+            headers=headers,
+            timeout=15.0,
+        )
         if resp.status_code >= 400:
             return []
         return _extract_list(resp.json())
@@ -531,8 +539,10 @@ async def _fetch_uw_form4(client: httpx.AsyncClient, headers: dict[str, str], ti
 
 async def _fetch_uw_buy_sells(client: httpx.AsyncClient, headers: dict[str, str], ticker: str) -> dict | None:
     try:
-        resp = await client.get(
+        resp = await uw_get(
+            client,
             f"{UW_BASE}/api/stock/{ticker}/insider-buy-sells",
+            limiter=get_uw_limiter(),
             headers=headers,
             timeout=15.0,
         )
@@ -546,8 +556,10 @@ async def _fetch_uw_buy_sells(client: httpx.AsyncClient, headers: dict[str, str]
 
 async def _fetch_uw_insider_flow(client: httpx.AsyncClient, headers: dict[str, str], ticker: str) -> list[dict]:
     try:
-        resp = await client.get(
+        resp = await uw_get(
+            client,
             f"{UW_BASE}/api/insider/{ticker}/ticker-flow",
+            limiter=get_uw_limiter(),
             headers=headers,
             timeout=15.0,
         )
@@ -563,8 +575,10 @@ async def _fetch_uw_political_holders(
     client: httpx.AsyncClient, headers: dict[str, str], ticker: str
 ) -> list[dict]:
     try:
-        resp = await client.get(
+        resp = await uw_get(
+            client,
             f"{UW_BASE}/api/politician-portfolios/holders/{ticker}",
+            limiter=get_uw_limiter(),
             headers=headers,
             timeout=15.0,
         )
@@ -580,8 +594,10 @@ async def _fetch_uw_congressional_trades(
     client: httpx.AsyncClient, headers: dict[str, str], ticker: str
 ) -> list[dict]:
     try:
-        resp = await client.get(
+        resp = await uw_get(
+            client,
             f"{UW_BASE}/api/congress/recent-trades",
+            limiter=get_uw_limiter(),
             headers=headers,
             params={"limit": 500},
             timeout=20.0,

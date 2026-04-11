@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from datetime import datetime, timezone
+from pathlib import Path
 
 import httpx
 import structlog
@@ -23,6 +24,7 @@ from grader.context.sector_cache import get_sector_cache
 from shared.config import load_config
 from shared.filters import InsiderScoringConfig
 from shared.models import Candidate
+from shared.uw_validation import bootstrap_uw_runtime_from_config, require_uw_api_token
 
 log = structlog.get_logger()
 
@@ -30,10 +32,23 @@ log = structlog.get_logger()
 async def run_grader(
     candidate_queue: asyncio.Queue[Candidate],
     scored_queue: asyncio.Queue[ScoredTrade],
+    *,
+    uw_already_bootstrapped: bool = False,
 ) -> None:
     """Consumer loop: pull candidates, grade them, push passing trades."""
-    config = load_config()
+    config_path = Path(__file__).resolve().parent.parent.parent / "config" / "rules.yaml"
+    if not config_path.exists():
+        config_path = Path("config/rules.yaml")
+    config = load_config(config_path)
     grader_cfg = config["grader"]
+    uw_cfg = config.get("unusual_whales") or {}
+    sector_refresh = float(uw_cfg.get("sector_cache_refresh_seconds", 8 * 3600))
+    sector_conc = int(uw_cfg.get("sector_fetch_concurrency", 2))
+
+    if not uw_already_bootstrapped and grader_cfg.get("enabled", True):
+        await bootstrap_uw_runtime_from_config(config)
+    elif grader_cfg.get("enabled", True):
+        require_uw_api_token()
 
     async with httpx.AsyncClient() as http_client:
         llm: LLMClient | None = None
@@ -99,7 +114,12 @@ async def run_grader(
                 continue
 
             # Gate 2: deterministic volatility + risk in parallel.
-            sector_cache = await get_sector_cache(http_client, config["uw_api_token"])
+            sector_cache = await get_sector_cache(
+                http_client,
+                config["uw_api_token"],
+                min_refresh_interval_seconds=sector_refresh,
+                max_fetch_concurrency=sector_conc,
+            )
             passed_gate2, vol_score, risk_score = await run_gate2(
                 candidate=candidate,
                 flow_score=flow_score,

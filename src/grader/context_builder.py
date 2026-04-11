@@ -9,6 +9,8 @@ import httpx
 import structlog
 
 from shared.models import Candidate
+from shared.uw_http import uw_get
+from shared.uw_runtime import get_uw_limiter
 
 from grader.models import GradingContext, Greeks, InsiderTrade, NewsItem
 
@@ -79,10 +81,11 @@ class ContextBuilder:
 
     async def _fetch_greeks_screener(self, ticker: str, strike: float, expiry: str) -> Greeks:
         """Fetch greeks via the validated options screener endpoint."""
-        resp = await self._client.get(
+        resp = await uw_get(
+            self._client,
             "https://api.unusualwhales.com/api/screener/option-contracts",
+            limiter=get_uw_limiter(),
             headers=self._headers,
-            # API params are not fully standardized across tiers; keep minimal + degrade gracefully.
             params={"ticker": ticker, "strike": strike, "expiry": expiry, "limit": 1},
         )
         resp.raise_for_status()
@@ -99,8 +102,10 @@ class ContextBuilder:
 
     async def _fetch_news(self, ticker: str) -> list[NewsItem]:
         """GET /api/news/headlines?ticker={ticker}"""
-        resp = await self._client.get(
+        resp = await uw_get(
+            self._client,
             "https://api.unusualwhales.com/api/news/headlines",
+            limiter=get_uw_limiter(),
             headers=self._headers,
             params={"ticker": ticker, "limit": 5},
         )
@@ -125,8 +130,10 @@ class ContextBuilder:
 
     async def _fetch_insider_trades(self, ticker: str) -> list[InsiderTrade]:
         """GET /api/insider/trades?ticker={ticker}"""
-        resp = await self._client.get(
+        resp = await uw_get(
+            self._client,
             "https://api.unusualwhales.com/api/insider/trades",
+            limiter=get_uw_limiter(),
             headers=self._headers,
             params={"ticker": ticker, "limit": 5},
         )
@@ -151,8 +158,10 @@ class ContextBuilder:
 
     async def _fetch_congressional_trades(self, ticker: str) -> list[InsiderTrade]:
         """GET /api/congressional-trading?ticker={ticker}"""
-        resp = await self._client.get(
+        resp = await uw_get(
+            self._client,
             "https://api.unusualwhales.com/api/congressional-trading",
+            limiter=get_uw_limiter(),
             headers=self._headers,
             params={"ticker": ticker, "limit": 5},
         )

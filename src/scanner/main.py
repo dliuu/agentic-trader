@@ -12,15 +12,15 @@ The main loop:
 """
 import argparse
 import asyncio
-import os
+import sys
 from datetime import datetime
 from pathlib import Path
 
+import httpx
 import structlog
 from dotenv import load_dotenv
 
 from scanner.client.uw_client import UWClient
-from scanner.client.rate_limiter import RateLimiter
 from scanner.models.market_tide import MarketTide
 from scanner.rules.engine import RuleEngine
 from scanner.rules.confluence import ConfluenceEnricher
@@ -30,26 +30,46 @@ from scanner.output.queue import CandidateQueue
 from scanner.utils.clock import MarketClock
 from scanner.utils.logging import setup_logging
 from shared.config import load_config
+from shared.uw_runtime import get_uw_limiter
+from shared.uw_validation import UWTokenError, bootstrap_uw_runtime_from_config, require_uw_api_token
 
 load_dotenv()
 logger = structlog.get_logger()
+
+
+def _is_429(exc: BaseException) -> bool:
+    if isinstance(exc, httpx.HTTPStatusError):
+        return exc.response.status_code == 429
+    return "429" in str(exc)
+
+
+def _cycle_has_429(*results: object) -> bool:
+    for r in results:
+        if isinstance(r, BaseException) and _is_429(r):
+            return True
+    return False
 
 
 async def run_scanner(
     force: bool = False,
     max_cycles: int | None = None,
     candidate_queue: asyncio.Queue | None = None,
+    *,
+    uw_already_bootstrapped: bool = False,
 ):
     config_path = Path(__file__).resolve().parent.parent.parent / "config" / "rules.yaml"
     if not config_path.exists():
         config_path = Path("config/rules.yaml")
     config = load_config(config_path)
 
-    rate_limiter = RateLimiter(calls_per_minute=30)
-    client = UWClient(
-        api_token=os.environ["UW_API_TOKEN"],
-        rate_limiter=rate_limiter,
-    )
+    if not uw_already_bootstrapped:
+        await bootstrap_uw_runtime_from_config(config)
+    else:
+        require_uw_api_token()
+
+    token = require_uw_api_token()
+    rate_limiter = get_uw_limiter()
+    client = UWClient(api_token=token, rate_limiter=rate_limiter)
     engine = RuleEngine(config)
     enricher = ConfluenceEnricher(config)
     dedup = DedupCache(
@@ -69,6 +89,10 @@ async def run_scanner(
         else CandidateQueue(max_size=config["output"]["queue_max_size"])
     )
     clock = MarketClock(config["polling"])
+    uw_cfg = config.get("unusual_whales") or {}
+    base_interval = float(config["polling"]["flow_alerts_interval_seconds"])
+    backoff_max = float(uw_cfg.get("poll_backoff_max_multiplier", 4.0))
+    poll_backoff = 1.0
 
     await db.connect()
 
@@ -96,10 +120,17 @@ async def run_scanner(
                 dp_task = client.get_dark_pool_recent()
                 tide_task = client.get_market_tide()
 
-                alerts, dark_pool, tide = await asyncio.gather(
+                raw_a, raw_d, raw_t = await asyncio.gather(
                     flow_task, dp_task, tide_task, return_exceptions=True
                 )
 
+                if _cycle_has_429(raw_a, raw_d, raw_t):
+                    poll_backoff = min(poll_backoff * 1.5, backoff_max)
+                    logger.info("scanner.poll_backoff_increased", multiplier=round(poll_backoff, 2))
+
+                alerts = raw_a
+                dark_pool = raw_d
+                tide = raw_t
                 if isinstance(alerts, Exception):
                     logger.error("flow_alerts_failed", error=str(alerts))
                     alerts = []
@@ -112,6 +143,9 @@ async def run_scanner(
                     logger.error("market_tide_failed", error=str(tide))
                     tide = None
                     errors += 1
+
+                if not _cycle_has_429(raw_a, raw_d, raw_t) and errors == 0:
+                    poll_backoff = max(poll_backoff / 1.25, 1.0)
 
                 new_alerts = []
                 for alert in alerts:
@@ -157,6 +191,7 @@ async def run_scanner(
                     market_tide_aligned=tide_aligned,
                     dedup_cache_size=dedup.size,
                     duration_ms=int((cycle_end - cycle_start).total_seconds() * 1000),
+                    poll_backoff_multiplier=round(poll_backoff, 2),
                 )
 
             except Exception as e:
@@ -166,7 +201,7 @@ async def run_scanner(
 
             if max_cycles is not None and cycle_count >= max_cycles:
                 break
-            await asyncio.sleep(config["polling"]["flow_alerts_interval_seconds"])
+            await asyncio.sleep(base_interval * poll_backoff)
 
     finally:
         await client.close()
@@ -192,7 +227,11 @@ def main():
         help="Run at most N polling cycles, then exit (default: run indefinitely)",
     )
     args = parser.parse_args()
-    asyncio.run(run_scanner(force=args.force, max_cycles=args.max_cycles))
+    try:
+        asyncio.run(run_scanner(force=args.force, max_cycles=args.max_cycles))
+    except UWTokenError as e:
+        print(str(e), file=sys.stderr)
+        raise SystemExit(1) from e
 
 
 if __name__ == "__main__":

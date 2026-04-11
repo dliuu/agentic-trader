@@ -20,6 +20,8 @@ import httpx
 import structlog
 
 from shared.models import Candidate
+from shared.uw_http import uw_get_json
+from shared.uw_runtime import get_uw_limiter
 
 logger = structlog.get_logger()
 
@@ -91,16 +93,40 @@ async def build_vol_context(
     headers = {
         "Authorization": f"Bearer {api_token}",
         "UW-CLIENT-API-ID": "100001",
+        "Accept": "application/json",
     }
+    limiter = get_uw_limiter()
 
     try:
         iv_resp, vol_resp, term_resp, chain_resp = await asyncio.gather(
-            client.get(f"{UW_BASE}/api/stock/{ticker}/iv-rank", headers=headers),
-            client.get(f"{UW_BASE}/api/stock/{ticker}/volatility/stats", headers=headers),
-            client.get(
-                f"{UW_BASE}/api/stock/{ticker}/volatility/term-structure", headers=headers
+            uw_get_json(
+                client,
+                f"{UW_BASE}/api/stock/{ticker}/iv-rank",
+                headers=headers,
+                limiter=limiter,
+                cache_key=f"uw:iv-rank:{ticker}",
             ),
-            client.get(f"{UW_BASE}/api/stock/{ticker}/option-chains", headers=headers),
+            uw_get_json(
+                client,
+                f"{UW_BASE}/api/stock/{ticker}/volatility/stats",
+                headers=headers,
+                limiter=limiter,
+                cache_key=f"uw:vol-stats:{ticker}",
+            ),
+            uw_get_json(
+                client,
+                f"{UW_BASE}/api/stock/{ticker}/volatility/term-structure",
+                headers=headers,
+                limiter=limiter,
+                cache_key=f"uw:term-structure:{ticker}",
+            ),
+            uw_get_json(
+                client,
+                f"{UW_BASE}/api/stock/{ticker}/option-chains",
+                headers=headers,
+                limiter=limiter,
+                cache_key=f"uw:option-chains:{ticker}",
+            ),
             return_exceptions=True,
         )
     except Exception as e:
@@ -124,23 +150,17 @@ async def build_vol_context(
             )
             return None  # all 4 endpoints required for meaningful scoring
 
-    for name, resp in responses.items():
-        if resp.status_code != 200:
-            logger.warning(
-                "vol_ctx.endpoint_error",
-                ticker=ticker,
-                endpoint=name,
-                status=resp.status_code,
-            )
-            return None
-
     try:
+        if not isinstance(iv_resp, dict) or not isinstance(vol_resp, dict):
+            return None
+        if not isinstance(term_resp, dict) or not isinstance(chain_resp, dict):
+            return None
         return _assemble_vol_context(
             candidate=candidate,
-            iv_data=iv_resp.json(),
-            vol_data=vol_resp.json(),
-            term_data=term_resp.json(),
-            chain_data=chain_resp.json(),
+            iv_data=iv_resp,
+            vol_data=vol_resp,
+            term_data=term_resp,
+            chain_data=chain_resp,
         )
     except Exception as e:
         logger.error("vol_ctx.assembly_failed", ticker=ticker, error=str(e))
@@ -162,7 +182,10 @@ def _assemble_vol_context(
     ticker = candidate.ticker
 
     # --- IV Rank data ---
-    iv_rank = _extract_float(iv_data, ["iv_rank", "ivRank", "rank"])
+    iv_rank = _extract_float(
+        iv_data,
+        ["iv_rank", "iv_rank_1y", "ivRank", "rank"],
+    )
     iv_percentile = _extract_float(
         iv_data,
         ["iv_percentile", "ivPercentile", "percentile"],

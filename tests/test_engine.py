@@ -1,3 +1,5 @@
+import datetime
+
 import pytest
 
 from scanner.models.flow_alert import FlowAlert
@@ -32,9 +34,13 @@ def test_engine_flags_candidate(sample_config, multi_signal_alert):
     assert len(result.signals) >= 2
 
 
-def test_engine_rejects_below_confluence(sample_config):
+def test_engine_rejects_below_confluence(sample_config, monkeypatch):
     """Single-signal alert should not pass min_signals_required=2."""
-    # OTM passes (5.3%), but expiry fails (20 DTE > max 14), execution fails (Split)
+    monkeypatch.setattr(
+        "scanner.models.flow_alert._today_for_dte",
+        lambda: datetime.date(2026, 3, 21),
+    )
+    # OTM passes (5.3%), but expiry fails (28 DTE > max 14), execution fails (Split)
     alert = FlowAlert(
         id="eng-2",
         ticker="WEAK",

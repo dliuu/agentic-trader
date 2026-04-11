@@ -22,7 +22,9 @@ def load_config(config_path: str | Path | None = None) -> dict:
 
     config = yaml.safe_load(config_path.read_text()) or {}
     # Inject secrets from environment (not stored in yaml)
-    config["uw_api_token"] = os.environ.get("UW_API_TOKEN", "")
+    config["uw_api_token"] = (
+        os.environ.get("UW_API_TOKEN") or os.environ.get("UNUSUAL_WHALES_API_TOKEN") or ""
+    ).strip()
     config["anthropic_api_key"] = os.environ.get("ANTHROPIC_API_KEY", "")
     config["finnhub_api_key"] = os.environ.get("FINNHUB_API_KEY", "")
     return config
