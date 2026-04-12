@@ -5,6 +5,7 @@ import asyncio
 import sys
 from pathlib import Path
 
+import httpx
 from dotenv import load_dotenv
 
 from grader.main import run_grader
@@ -14,6 +15,10 @@ from scanner.utils.logging import setup_logging
 from shared.config import load_config
 from shared.models import Candidate
 from shared.uw_validation import UWTokenError, bootstrap_uw_runtime_from_config
+from tracker.config import load_tracker_config
+from tracker.intake import run_signal_intake
+from tracker.models import Signal
+from tracker.monitor import run_monitor
 
 load_dotenv()
 
@@ -25,18 +30,46 @@ async def main(force: bool = False, max_cycles: int | None = None):
     config = load_config(config_path)
     await bootstrap_uw_runtime_from_config(config)
 
-    candidate_queue: asyncio.Queue[Candidate] = asyncio.Queue()
-    scored_queue: asyncio.Queue[ScoredTrade] = asyncio.Queue()
+    tracker_cfg = load_tracker_config(config)
 
-    await asyncio.gather(
-        run_scanner(
-            force=force,
-            max_cycles=max_cycles,
-            candidate_queue=candidate_queue,
-            uw_already_bootstrapped=True,
-        ),
-        run_grader(candidate_queue, scored_queue, uw_already_bootstrapped=True),
-    )
+    candidate_queue: asyncio.Queue[Candidate] = asyncio.Queue()
+    scored_queue: asyncio.Queue[ScoredTrade | None] = asyncio.Queue()
+    executor_queue: asyncio.Queue[Signal] = asyncio.Queue()
+
+    # Resolve scanner DB path for flow watcher
+    scanner_db_path = config["output"]["sqlite_db_path"]
+    if not Path(scanner_db_path).is_absolute():
+        project_root = config_path.resolve().parent.parent
+        scanner_db_path = str(project_root / scanner_db_path)
+
+    async with httpx.AsyncClient(timeout=15.0) as http_client:
+        tasks = [
+            run_scanner(
+                force=force,
+                max_cycles=max_cycles,
+                candidate_queue=candidate_queue,
+                uw_already_bootstrapped=True,
+            ),
+            run_grader(candidate_queue, scored_queue, uw_already_bootstrapped=True),
+        ]
+
+        if tracker_cfg.enabled:
+            tasks.append(
+                run_signal_intake(scored_queue, config=tracker_cfg)
+            )
+            tasks.append(
+                run_monitor(
+                    client=http_client,
+                    api_token=config["uw_api_token"],
+                    executor_queue=executor_queue,
+                    config=tracker_cfg,
+                    polling_config=config.get("polling"),
+                    scanner_db_path=scanner_db_path,
+                    max_cycles=max_cycles,
+                )
+            )
+
+        await asyncio.gather(*tasks)
 
 
 def cli():

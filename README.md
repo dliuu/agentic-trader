@@ -8,7 +8,7 @@ A multi-gate pipeline for unusual options flow:
 - **Gate 2 (Volatility Analyst + Risk Analyst)** — Deterministic “is the buyer getting a good deal?” layer. The **Volatility Analyst** fetches 4 UW volatility/chain endpoints per candidate (no LLM), and the **Risk Analyst** scores structural conviction from buyer risk accepted (premium, DTE, spread, OTM distance, move ratio, liquidity, earnings proximity). Gate 2 passes when the average of (flow + vol + risk) meets the configured threshold.
 - **Gate 3 (Specialists + synthesis)** — Runs **Sentiment Analyst**, **Insider Tracker**, and a deterministic **Sector Analyst** in parallel (each emits a `SubScore`). Those scores are merged with Gate 1–2 sub-scores into a **deterministic aggregator** (weighted average, disagreement, six conflict detectors). A final **Synthesis** step makes **one** Claude call to produce the 1–100 score, applies deterministic caps, merges position sizing with the risk analyst, and emits a passing `ScoredTrade` if the score meets the threshold. See [Synthesis layer (Gate 3)](#synthesis-layer-gate-3) and the specialist sections below.
 
-**Key features:** Confluence enrichment (dark pool + market tide), **Gate 0** universe filter (static lists + cached UW stock info), deterministic Gates 1–2 before most LLM spend, Gate 3 uses three specialist calls plus one synthesis call (not the legacy single-shot context grader in production), optional `GATE0_ALLOW_LIST` for a focused ticker set, `--force` to bypass market hours, `--max-cycles` for limited runs, dual logging (terminal + `scanner.json.log`), grader pass-through mode (`grader.enabled: false`), audit logging to SQLite (`flow_scores` + `grades`), and a **signal tracker** package (`src/tracker/`) with YAML-backed `TrackerConfig`, Pydantic models (`Signal`, snapshots, chain/flow result types), **`ChainPoller`** (UW `/api/stock/{ticker}/option-chains`), **`FlowWatcher`** (UW flow alerts plus optional scanner `candidates` DB), and `SignalStore` persistence on **`signals`** / **`signal_snapshots`** in `data/trades.db` (see [Signal Tracker](#signal-tracker)).
+**Key features:** Confluence enrichment (dark pool + market tide), **Gate 0** universe filter (static lists + cached UW stock info), deterministic Gates 1–2 before most LLM spend, Gate 3 uses three specialist calls plus one synthesis call (not the legacy single-shot context grader in production), optional `GATE0_ALLOW_LIST` for a focused ticker set, `--force` to bypass market hours, `--max-cycles` for limited runs, dual logging (terminal + `scanner.json.log`), grader pass-through mode (`grader.enabled: false`), audit logging to SQLite (`flow_scores` + `grades`), and a **signal tracker** package (`src/tracker/`) with YAML-backed `TrackerConfig`, Pydantic models (`Signal`, snapshots, chain/flow result types), **`ChainPoller`** (UW `/api/stock/{ticker}/option-chains`), **`FlowWatcher`** (UW flow alerts plus optional scanner `candidates` DB), deterministic **`ConvictionEngine`**, **`run_signal_intake`** / **`run_monitor`** wired from **`scanner.run_pipeline`** when **`tracker.enabled`**, and `SignalStore` on **`signals`** / **`signal_snapshots`** in `data/trades.db` (see [Signal Tracker](#signal-tracker)).
 
 ### Quick run (full pipeline)
 
@@ -133,7 +133,7 @@ whale-scanner --force --max-cycles 3
 
 | Entry | What it runs |
 |-------|----------------|
-| `scanner.run_pipeline` / `whale-pipeline` | `run_scanner` ∥ `run_grader` (full queue pipeline) |
+| `scanner.run_pipeline` / `whale-pipeline` | `run_scanner` ∥ `run_grader`, and when `tracker.enabled` in `rules.yaml`: **`run_signal_intake`** (consumes `scored_queue`) ∥ **`run_monitor`** (shared `httpx.AsyncClient`, `executor_queue` for future Agent C). Grader sends `None` on `scored_queue` after shutdown so intake exits. |
 | `scanner.main` / `whale-scanner` | Scanner loop only (no consumer grading) |
 
 ### Stop a running pipeline
@@ -177,13 +177,14 @@ Press **`Ctrl+C`** in the terminal to interrupt the process.
 │                                            │ caps · verdict · risk   │ │
 │                                            └──────────┬──────────────┘ │
 │                                                       │                │
-│                                            Scored Queue → (Agent C)     │
+│                                            Scored Queue → Intake → Signals │
+│                                            Monitor → executor_queue (Agent C) │
 └───────────────────────────────────────────────────────────────────────┘
 ```
 
 The scanner runs as an async producer: every cycle it fetches flow alerts, dark pool prints, and market tide from the Unusual Whales API, deduplicates, runs the rule engine, enriches with confluence data, persists to SQLite, and pushes candidates into a shared queue. The grader consumer runs **Gate 0** (universe filter), then **Gates 1–3**: deterministic flow, then vol + risk, then parallel specialists, deterministic aggregation, and a single synthesis LLM call (when grading is enabled). Shared code lives in `src/shared/` (models, config, db, filters).
 
-A **signal tracker** peer module in `src/tracker/` is designed to turn passing `ScoredTrade` outputs into long-lived **`Signal`** rows, poll option chains and flow over time, and move conviction through states (`pending` → `accumulating` → `actionable`, or terminal `expired` / `decayed` / `executed`). The **models, configuration loader, SQLite schema, `SignalStore`, and read-only fetchers `ChainPoller` + `FlowWatcher`** (returning `ChainPollResult` / `FlowWatchResult`) are implemented; the **conviction engine, snapshots from the monitor, and `run_pipeline` wiring** (intake + monitor loop) are optional follow-up work.
+A **signal tracker** peer module in `src/tracker/` turns passing **`ScoredTrade`** outputs into long-lived **`Signal`** rows (**`run_signal_intake`**), polls chains and flow (**`run_monitor`** → `ChainPoller` + `FlowWatcher` + **`ConvictionEngine`**), persists **`SignalSnapshot`** rows, updates SQLite, and enqueues **`ACTIONABLE`** signals on **`executor_queue`** for a future Agent C consumer. Toggle with **`tracker.enabled`** in `config/rules.yaml`. With **`--max-cycles N`**, the monitor runs at most **N** poll cycles so the whole `asyncio.gather` can exit after the scanner stops (in addition to the grader→intake `None` sentinel).
 
 ---
 
@@ -198,7 +199,7 @@ At a high level, the pipeline is:
 5. **Gate 2 (Volatility Analyst + Risk Analyst)** runs in parallel and determines whether the buyer is paying fair implied volatility relative to the ticker’s own history, sector peers, and the broader market. Gate 2 is deterministic and designed to be low-latency.
 6. **Gate 3** runs three specialists in parallel (**Sentiment**, **Insider**, **Sector**), each producing a `SubScore` (failures become skipped neutral scores so the pipeline continues). Insider Tracker may skip its LLM when there is no qualifying data (see [Insider Tracker (Gate 3)](#insider-tracker-gate-3)).
 7. **Aggregation + synthesis** (when `grader.enabled` is true) merges all six sub-scores (flow, vol, risk, sentiment, insider, sector), computes a renormalized weighted average, population stdev, agreement label, and conflict flags (`grader.aggregator`). **Synthesis** (`grader.synthesis`) builds a dedicated prompt (`grader.synthesis_prompt`), calls Claude once, parses JSON, applies deterministic score caps, sets verdict from the final score (≥70 pass), sets `TradeRiskParams.recommended_position_size` to `min(LLM modifier, risk analyst size)`, logs every outcome to `grades` in `data/trades.db`, and enqueues a `ScoredTrade` only if the final score ≥ `grader.score_threshold`.
-8. **Signal tracker (optional path)** — High-scoring trades can be materialized as **`Signal`** records in SQLite and monitored over days via **`SignalSnapshot`** history, using thresholds and scoring weights from the **`tracker:`** section in `config/rules.yaml` (`load_tracker_config` in `tracker.config`). The persistence API is **`tracker.signal_store.SignalStore`**. **`tracker.chain_poller.ChainPoller`** issues one UW GET per signal to **`/api/stock/{ticker}/option-chains`** (via `uw_get_json`, uncached) and fills **`ChainPollResult`**. **`tracker.flow_watcher.FlowWatcher`** merges UW **`/api/option-trades/flow-alerts`** (ticker filter) with rows from the scanner’s **`candidates`** table when `scanner_db_path` is set (`output.sqlite_db_path`). Neither component writes to `signals`; they only fetch data for a future conviction/monitor loop.
+8. **Signal tracker (`tracker.enabled`)** — **`scanner.run_pipeline`** wraps tasks in a shared **`httpx.AsyncClient`** and, when enabled, runs **`run_signal_intake(scored_queue)`** alongside the grader. Intake creates **`Signal`** rows (capacity + dedup checks) from each **`ScoredTrade`**. **`run_monitor`** loads active signals, runs **`ChainPoller`** → **`FlowWatcher`** (scanner DB path resolved from **`output.sqlite_db_path`**) → **`ConvictionEngine`**, writes snapshots (subject to **`max_snapshots_per_signal`**), updates the signal row, logs state changes, and **`put`s** newly **`ACTIONABLE`** signals on **`executor_queue`**. **`grader.main.run_grader`** appends **`None`** to **`scored_queue`** after the candidate sentinel so intake shuts down cleanly. **`ConvictionEngine`** remains pure logic (no I/O). Disable the tracker by setting **`tracker.enabled: false`**.
 9. **Legacy `Grader` class** (`grader.grader`) — older single-shot “context builder → one LLM” path kept for unit tests; **production** `grader.main` uses `run_gate3` + `SynthesisAgent` instead.
 
 ---
@@ -605,7 +606,7 @@ whale-scanner/
 │   ├── scanner/
 │   │   ├── __init__.py
 │   │   ├── main.py               # Scanner loop
-│   │   ├── run_pipeline.py       # Full pipeline: scanner + grader
+│   │   ├── run_pipeline.py       # Scanner + grader + optional tracker tasks (intake, monitor)
 │   │   ├── client/
 │   │   │   ├── uw_client.py
 │   │   │   └── rate_limiter.py
@@ -633,6 +634,9 @@ whale-scanner/
 │   │   ├── models.py             # Signal, SignalSnapshot, ChainPollResult, FlowWatchResult, etc.
 │   │   ├── chain_poller.py       # ChainPoller → ChainPollResult (UW option-chains)
 │   │   ├── flow_watcher.py       # FlowWatcher → FlowWatchResult (UW flow + optional scanner DB)
+│   │   ├── conviction.py         # ConvictionEngine — deterministic scoring + state machine
+│   │   ├── intake.py             # run_signal_intake — ScoredTrade → Signal
+│   │   ├── monitor.py            # run_monitor — poll loop + snapshots + executor_queue
 │   │   └── signal_store.py       # SignalStore CRUD for signals + snapshots
 │   └── grader/
 │       ├── __init__.py
@@ -693,7 +697,8 @@ whale-scanner/
 │   ├── test_tracker_models.py    # Tracker config + SignalState / Signal helpers
 │   ├── test_signal_store.py      # SignalStore SQLite (uses temp DB via fixture)
 │   ├── test_chain_poller.py      # ChainPoller + respx mocks
-│   └── test_flow_watcher.py      # FlowWatcher + respx mocks
+│   ├── test_flow_watcher.py      # FlowWatcher + respx mocks
+│   └── test_conviction.py        # ConvictionEngine (no I/O)
 ├── scripts/
 │   ├── backfill.py
 │   └── replay.py
@@ -750,7 +755,7 @@ Defined in `src/tracker/models.py`. Core types:
 
 - **`Signal`** — Persistent tracked contract: ticker/strike/expiry/option side, `SignalState` (`pending`, `accumulating`, `actionable`, `executed`, `expired`, `decayed`), grading provenance (`grade_id`, `initial_score`, OI/volume/premium baselines), rolling conviction fields (`conviction_score`, `confirming_flows`, `oi_high_water`, etc.), and optional `risk_params_json` / `anomaly_fingerprint` for downstream execution.
 - **`SignalSnapshot`** — One row per poll cycle: contract quotes/OI, neighborhood aggregates, new-flow counts/premium, and conviction engine output (`conviction_delta`, `conviction_after`, `signals_fired`).
-- **`ChainPollResult`**, **`FlowWatchResult`**, **`NeighborStrike`**, **`AdjacentExpiryOI`**, **`FlowEvent`** — Structured outputs produced by **`ChainPoller.poll()`** and **`FlowWatcher.check()`** for the conviction engine (Part 3) and monitor loop.
+- **`ChainPollResult`**, **`FlowWatchResult`**, **`NeighborStrike`**, **`AdjacentExpiryOI`**, **`FlowEvent`** — Structured outputs from **`ChainPoller.poll()`** and **`FlowWatcher.check()`**, consumed by **`ConvictionEngine.evaluate()`** (`tracker.conviction`), which emits a **`ConvictionResult`** (delta, fired rule tags, recommended `next_state`, terminal reason when applicable).
 
 ---
 
@@ -880,7 +885,7 @@ The `grader` section in `config/rules.yaml` controls Agent B:
 
 ## Signal Tracker
 
-The **signal tracker** is a peer package under `src/tracker/` for **stateful monitoring** of candidates that have already cleared the grading pipeline. Instead of treating a high synthesis score as a one-shot go/no-go, the design stores a **`Signal`**, records periodic **`SignalSnapshot`** rows, and (when the full loop is connected) refreshes conviction from option-chain and unusual-flow evidence against tunables in YAML.
+The **signal tracker** is a peer package under `src/tracker/` for **stateful monitoring** after the grader emits **`ScoredTrade`** objects. **`run_pipeline`** wires it in when **`tracker.enabled`** is true.
 
 ### What is implemented today
 
@@ -889,16 +894,21 @@ The **signal tracker** is a peer package under `src/tracker/` for **stateful mon
 | Configuration | `config/rules.yaml` → `tracker:` | Polling cadence, monitoring window, capacity caps, actionable/decay thresholds, neighbor radii, per-cycle scoring weights |
 | Typed config | `tracker.config` | `TrackerConfig`, `ConvictionScoringConfig`, `load_tracker_config(dict)` |
 | Domain models | `tracker.models` | `Signal`, `SignalSnapshot`, enums/constants, plus chain/flow DTOs |
-| Chain poller | `tracker.chain_poller.ChainPoller` | One UW call per poll to `/api/stock/{ticker}/option-chains`; neighbors ±`neighbor_strike_radius`, adjacent expiries ±`neighbor_expiry_radius`; `uw_get_json(..., use_cache=False)` |
-| Flow watcher | `tracker.flow_watcher.FlowWatcher` | UW `/api/option-trades/flow-alerts` with `ticker_symbol` + `limit`; optional merge from scanner `candidates` when constructed with `scanner_db_path` (defaults to `None`) |
-| Persistence | `tracker.signal_store.SignalStore` | Async SQLite CRUD: create/update signals, append snapshots, list actives, duplicate check |
-| Schema | `shared.db._ensure_tables` | `signals` + `signal_snapshots` (+ indexes) alongside existing grader tables |
+| Intake | `tracker.intake.run_signal_intake` | Async consumer of **`scored_queue`**; creates **`Signal`** rows (`PENDING`), honors **`max_active_signals`** + duplicate contract check |
+| Monitor | `tracker.monitor.run_monitor` | Interval from **`MarketClock`** + `poll_interval_*`; per active signal: poll chain, watch flow, **`ConvictionEngine.evaluate`**, snapshot cap, DB update, **`executor_queue`** on first **`ACTIONABLE`** |
+| Chain poller | `tracker.chain_poller.ChainPoller` | One UW call per poll to `/api/stock/{ticker}/option-chains`; `uw_get_json(..., use_cache=False)` |
+| Flow watcher | `tracker.flow_watcher.FlowWatcher` | UW flow alerts + optional scanner **`candidates`** DB (`output.sqlite_db_path` resolved to an absolute path in **`run_pipeline`**) |
+| Conviction engine | `tracker.conviction.ConvictionEngine` | Pure scoring + state recommendation; no network or DB |
+| Pipeline wiring | `scanner.run_pipeline.main` | `async with httpx.AsyncClient` → `asyncio.gather(run_scanner, run_grader, [intake, monitor])`; passes **`max_cycles`** into **`run_monitor`** for bounded test runs |
+| Grader sentinel | `grader.main.run_grader` | After the candidate **`None`** sentinel, **`await scored_queue.put(None)`** so intake exits |
+| Persistence | `tracker.signal_store.SignalStore` | Async SQLite CRUD for **`signals`** / **`signal_snapshots`** |
+| Schema | `shared.db._ensure_tables` | `signals` + `signal_snapshots` (+ indexes) alongside grader tables |
 
-Load the tracker section after parsing YAML (same `load_config()` flow as the rest of the app): pass the top-level dict into `load_tracker_config`.
+Load the tracker section after parsing YAML: `load_tracker_config(load_config(...))`.
 
 ### Integration note
 
-**`scanner.run_pipeline`** does not yet spawn signal-intake or monitor tasks; grader behavior is unchanged. **`ChainPoller`** and **`FlowWatcher`** do not mutate `signals` or snapshots; wiring them into a poll loop with **`ConvictionEngine`** (Part 3) is a separate step.
+**Agent C** is not implemented here: **`executor_queue`** receives **`Signal`** objects when they first become **`ACTIONABLE`**; a downstream consumer can be added later. Set **`tracker.enabled: false`** to run the historical two-task pipeline only (the grader still sends the scored-queue **`None`** sentinel; nothing consumes it).
 
 ---
 
@@ -964,12 +974,12 @@ python -m pytest tests/test_risk_analyst.py -v --tb=short
 python -m pytest tests/test_gate0.py -v --tb=short
 
 # Signal tracker (models + SignalStore + chain poller + flow watcher); set PYTHONPATH=src if imports fail
-PYTHONPATH=src python -m pytest tests/test_tracker_models.py tests/test_signal_store.py tests/test_chain_poller.py tests/test_flow_watcher.py -v
+PYTHONPATH=src python -m pytest tests/test_tracker_models.py tests/test_signal_store.py tests/test_chain_poller.py tests/test_flow_watcher.py tests/test_conviction.py -v
 ```
 
 Ensure the venv is activated and the project is installed (`pip install -e ".[dev,grader]"`). Pytest is configured with `pythonpath = ["."]` in `pyproject.toml` so imports like `tests.fixtures.*` resolve when running from the repo root.
 
-Notable suites: `tests/test_gate0.py`, `tests/test_sector_cache.py`, `tests/test_vol_analyst.py`, `tests/test_risk_analyst.py`, `tests/test_sector_analyst.py`, `tests/test_sentiment_analyst.py`, `tests/test_insider_tracker.py`, `tests/test_flow_analyst.py`, `tests/test_tracker_models.py`, `tests/test_signal_store.py`, `tests/test_chain_poller.py`, `tests/test_flow_watcher.py`.
+Notable suites: `tests/test_gate0.py`, `tests/test_sector_cache.py`, `tests/test_vol_analyst.py`, `tests/test_risk_analyst.py`, `tests/test_sector_analyst.py`, `tests/test_sentiment_analyst.py`, `tests/test_insider_tracker.py`, `tests/test_flow_analyst.py`, `tests/test_tracker_models.py`, `tests/test_signal_store.py`, `tests/test_chain_poller.py`, `tests/test_flow_watcher.py`, `tests/test_conviction.py`.
 
 If your default `python` is not 3.11+, run tests with `python3.11 -m pytest ...` (project requires Python 3.11+).
 

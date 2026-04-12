@@ -32,7 +32,7 @@ log = structlog.get_logger()
 
 async def run_grader(
     candidate_queue: asyncio.Queue[Candidate],
-    scored_queue: asyncio.Queue[ScoredTrade],
+    scored_queue: asyncio.Queue[ScoredTrade | None],
     *,
     uw_already_bootstrapped: bool = False,
 ) -> None:
@@ -168,6 +168,9 @@ async def run_grader(
                 await scored_queue.put(scored_trade)
 
             candidate_queue.task_done()
+
+        # Signal to intake that grading is done
+        await scored_queue.put(None)
 
         if llm is not None:
             await llm.close()
