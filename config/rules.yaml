@@ -103,3 +103,50 @@ grader:
   timeout_seconds: 15
   max_parse_retries: 1
   enabled: true               # Toggle to disable grading (pass-through mode)
+
+# Signal Tracker — monitors candidates that pass all grading gates
+tracker:
+  enabled: true
+
+  # Polling cadence
+  poll_interval_market_seconds: 300      # 5 min during market hours
+  poll_interval_off_hours_seconds: 1800  # 30 min pre/post market
+  morning_reconciliation: true           # extra poll at market open for overnight changes
+
+  # Monitoring window — how long to track a signal before giving up
+  monitoring_window_days: 7              # max calendar days to watch a pending/accumulating signal
+  min_dte_for_monitoring: 3             # stop monitoring if option DTE drops below this
+
+  # Capacity limits
+  max_active_signals: 10                # pause new signal creation if this many are active
+  max_snapshots_per_signal: 500         # cap storage per signal (5min × 6.5hrs × 7days ≈ 546)
+
+  # Conviction thresholds — when does a signal become actionable?
+  actionable_conviction: 90.0           # conviction score must reach this
+  actionable_min_confirming_flows: 2    # must see at least N new flow events
+  actionable_min_oi_ratio: 1.5          # current OI / initial OI must exceed this
+
+  # Decay thresholds — when does a signal die?
+  decay_conviction: 60.0                # signal decays if conviction drops below this
+  decay_window_conviction: 80.0         # must reach this within monitoring_window_days or decays
+  silence_decay_days: 2                 # days of no new flow before silence penalty kicks in
+
+  # Neighbor analysis
+  neighbor_strike_radius: 5             # check ±N strikes from signal's strike
+  neighbor_expiry_radius: 1             # check ±N expiries from signal's expiry
+
+  # Conviction scoring deltas (per poll cycle)
+  scoring:
+    oi_increase_per_10pct: 2            # +N per 10% OI increase
+    oi_increase_cap: 8                  # max bonus from OI increase per cycle
+    confirming_flow_bonus: 5            # +N per new flow event on same ticker
+    confirming_flow_cap: 15             # max bonus from new flow per cycle
+    ghost_strike_bonus: 3               # +N per new active strike on same expiry
+    put_call_shift_bonus: 3             # +N if put/call ratio shifts toward signal direction
+    premium_accumulation_bonus: 2       # +N if cumulative premium > 2x initial
+
+    oi_decrease_per_10pct: -3           # penalty per 10% OI decrease
+    spread_widened_penalty: -5          # penalty if bid-ask > 20%
+    silence_penalty_per_day: -4         # penalty per day of no new flow (after silence_decay_days)
+    spot_moved_away_per_5pct: -2        # penalty per 5% spot moves away from strike
+    dte_pressure_below_14: -3           # penalty per day when DTE < 14

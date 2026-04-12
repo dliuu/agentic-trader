@@ -54,6 +54,66 @@ async def _ensure_tables(db: aiosqlite.Connection) -> None:
             skip_reason TEXT,
             scored_at TEXT NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS signals (
+            id TEXT PRIMARY KEY,
+            ticker TEXT NOT NULL,
+            strike REAL NOT NULL,
+            expiry TEXT NOT NULL,
+            option_type TEXT NOT NULL,
+            direction TEXT NOT NULL,
+            state TEXT NOT NULL DEFAULT 'pending',
+            initial_score INTEGER NOT NULL,
+            initial_premium REAL NOT NULL,
+            initial_oi INTEGER NOT NULL,
+            initial_volume INTEGER NOT NULL,
+            initial_contract_adv INTEGER NOT NULL DEFAULT 0,
+            grade_id TEXT NOT NULL,
+            conviction_score REAL NOT NULL,
+            snapshots_taken INTEGER NOT NULL DEFAULT 0,
+            confirming_flows INTEGER NOT NULL DEFAULT 0,
+            oi_high_water INTEGER NOT NULL DEFAULT 0,
+            chain_spread_count INTEGER NOT NULL DEFAULT 0,
+            cumulative_premium REAL NOT NULL DEFAULT 0.0,
+            days_without_flow INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL,
+            last_polled_at TEXT,
+            last_flow_at TEXT,
+            matured_at TEXT,
+            terminal_at TEXT,
+            terminal_reason TEXT,
+            risk_params_json TEXT,
+            anomaly_fingerprint TEXT DEFAULT '',
+            FOREIGN KEY (grade_id) REFERENCES grades(id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_signals_state ON signals(state);
+        CREATE INDEX IF NOT EXISTS idx_signals_ticker ON signals(ticker);
+        CREATE INDEX IF NOT EXISTS idx_signals_expiry ON signals(expiry);
+
+        CREATE TABLE IF NOT EXISTS signal_snapshots (
+            id TEXT PRIMARY KEY,
+            signal_id TEXT NOT NULL,
+            snapshot_at TEXT NOT NULL,
+            contract_oi INTEGER,
+            contract_volume INTEGER,
+            contract_bid REAL,
+            contract_ask REAL,
+            contract_spread_pct REAL,
+            spot_price REAL,
+            neighbor_oi_total INTEGER,
+            neighbor_strikes_active INTEGER,
+            neighbor_put_call_ratio REAL,
+            new_flow_count INTEGER DEFAULT 0,
+            new_flow_premium REAL DEFAULT 0.0,
+            new_flow_same_contract INTEGER DEFAULT 0,
+            new_flow_same_expiry INTEGER DEFAULT 0,
+            conviction_delta REAL DEFAULT 0.0,
+            conviction_after REAL DEFAULT 0.0,
+            signals_fired TEXT,
+            notes TEXT,
+            FOREIGN KEY (signal_id) REFERENCES signals(id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_snapshots_signal ON signal_snapshots(signal_id);
+        CREATE INDEX IF NOT EXISTS idx_snapshots_at ON signal_snapshots(snapshot_at);
         """
     )
     await db.commit()
