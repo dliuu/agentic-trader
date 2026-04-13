@@ -23,6 +23,7 @@ from scanner.utils.clock import MarketClock
 from tracker.chain_poller import ChainPoller
 from tracker.config import TrackerConfig
 from tracker.conviction import ConvictionEngine
+from tracker.flow_ledger import FlowLedger, ledger_entry_from_flow_event
 from tracker.flow_watcher import FlowWatcher
 from tracker.models import Signal, SignalSnapshot, SignalState
 from tracker.signal_store import SignalStore
@@ -59,7 +60,13 @@ async def run_monitor(
 
     store = SignalStore()
     poller = ChainPoller(client, api_token, config=cfg)
-    watcher = FlowWatcher(client, api_token, scanner_db_path=scanner_db_path)
+    flow_ledger = FlowLedger() if cfg.ledger.enabled else None
+    watcher = FlowWatcher(
+        client,
+        api_token,
+        scanner_db_path=scanner_db_path,
+        flow_ledger=flow_ledger,
+    )
     engine = ConvictionEngine(config=cfg)
 
     # Build market clock for hours detection
@@ -103,7 +110,7 @@ async def run_monitor(
         for signal in active_signals:
             try:
                 await _process_signal(
-                    signal, store, poller, watcher, engine, executor_queue, cfg
+                    signal, store, poller, watcher, engine, executor_queue, cfg, flow_ledger
                 )
             except Exception as exc:
                 log.error(
@@ -114,6 +121,19 @@ async def run_monitor(
                 )
 
         log.info("monitor.cycle_complete", cycle=cycle_count)
+
+        if (
+            flow_ledger is not None
+            and cfg.ledger.retention_days > 0
+            and cycle_count > 0
+            and cycle_count % 20 == 0
+        ):
+            try:
+                n = await flow_ledger.purge_entries_older_than(cfg.ledger.retention_days)
+                if n:
+                    log.info("monitor.ledger_retention_purge", rows=n)
+            except Exception as exc:
+                log.warning("monitor.ledger_retention_failed", error=str(exc))
 
         if max_cycles is not None and cycle_count >= max_cycles:
             break
@@ -131,6 +151,7 @@ async def _process_signal(
     engine: ConvictionEngine,
     executor_queue: asyncio.Queue[Signal],
     cfg: TrackerConfig,
+    flow_ledger: FlowLedger | None,
 ) -> None:
     """Run one poll cycle for a single signal."""
     now = datetime.now(timezone.utc)
@@ -144,8 +165,25 @@ async def _process_signal(
     # 3. Watch for new flow
     flow = await watcher.check(signal)
 
+    # 3.5–3.6: persist watcher events to ledger, then aggregate for conviction
+    ledger_agg = None
+    if flow_ledger is not None:
+        for event in flow.events:
+            await flow_ledger.record(
+                ledger_entry_from_flow_event(
+                    event,
+                    signal_id=signal.id,
+                    signal=signal,
+                    source="flow_watcher",
+                    recorded_at=now,
+                )
+            )
+        ledger_agg = await flow_ledger.aggregate(signal.id)
+
     # 4. Evaluate conviction
-    result = engine.evaluate(signal, chain, flow, prev_snapshot)
+    result = engine.evaluate(
+        signal, chain, flow, prev_snapshot, ledger_aggregate=ledger_agg
+    )
 
     # 5. Compute new values
     new_conviction = max(0.0, min(100.0,
@@ -242,6 +280,18 @@ async def _process_signal(
         )
 
     await store.update_signal(signal.id, **update_fields)
+
+    if (
+        flow_ledger is not None
+        and cfg.ledger.purge_terminal_signals
+        and new_state in (SignalState.EXPIRED, SignalState.DECAYED, SignalState.EXECUTED)
+    ):
+        try:
+            deleted = await flow_ledger.purge_terminal(signal.id)
+            if deleted:
+                log.info("monitor.ledger_purged_signal", signal_id=signal.id, rows=deleted)
+        except Exception as exc:
+            log.warning("monitor.ledger_purge_failed", signal_id=signal.id, error=str(exc))
 
     # 8. Push actionable signals to executor
     if new_state == SignalState.ACTIONABLE and signal.state != SignalState.ACTIONABLE:

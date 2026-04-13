@@ -19,6 +19,12 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# Minimal deps to run the test suite (CI-friendly; includes HTTP mocking).
+test = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "respx>=0.21",
+]
 dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.23",
@@ -51,4 +57,5 @@ strict = true
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
-pythonpath = ["."]
+# Packages live under src/ (grader, scanner, shared, tracker); "." keeps tests/conftest imports stable.
+pythonpath = ["src", "."]

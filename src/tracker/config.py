@@ -6,6 +6,15 @@ from dataclasses import dataclass
 
 
 @dataclass(frozen=True)
+class LedgerConfig:
+    """Flow ledger (watched-ticker bypass + conviction context)."""
+
+    enabled: bool = True
+    purge_terminal_signals: bool = True
+    retention_days: int = 30
+
+
+@dataclass(frozen=True)
 class ConvictionScoringConfig:
     """Point deltas applied each poll cycle based on observed evidence."""
 
@@ -65,6 +74,9 @@ class TrackerConfig:
     # Scoring
     scoring: ConvictionScoringConfig = ConvictionScoringConfig()
 
+    # Flow ledger (scanner bypass + monitor / flow_watcher)
+    ledger: LedgerConfig = LedgerConfig()
+
 
 def load_tracker_config(raw_config: dict) -> TrackerConfig:
     """Build TrackerConfig from the parsed rules.yaml dict.
@@ -74,6 +86,12 @@ def load_tracker_config(raw_config: dict) -> TrackerConfig:
                     'tracker' key. Missing keys use dataclass defaults.
     """
     section = raw_config.get("tracker") or {}
+    ledger_raw = section.get("ledger") or {}
+    ledger = LedgerConfig(
+        enabled=bool(ledger_raw.get("enabled", True)),
+        purge_terminal_signals=bool(ledger_raw.get("purge_terminal_signals", True)),
+        retention_days=int(ledger_raw.get("retention_days", 30)),
+    )
     scoring_raw = section.get("scoring") or {}
 
     scoring = ConvictionScoringConfig(
@@ -109,4 +127,5 @@ def load_tracker_config(raw_config: dict) -> TrackerConfig:
         neighbor_strike_radius=int(section.get("neighbor_strike_radius", 5)),
         neighbor_expiry_radius=int(section.get("neighbor_expiry_radius", 1)),
         scoring=scoring,
+        ledger=ledger,
     )

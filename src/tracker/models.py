@@ -30,6 +30,13 @@ ACTIVE_STATES = frozenset({
     SignalState.ACCUMULATING,
 })
 
+# Signals still receiving scanner ledger + ticker-level intake dedup (excludes terminal).
+MONITORING_STATES = frozenset({
+    SignalState.PENDING,
+    SignalState.ACCUMULATING,
+    SignalState.ACTIONABLE,
+})
+
 
 class Signal(BaseModel):
     """A living, tracked anomaly.
@@ -209,3 +216,49 @@ class FlowEvent(BaseModel):
     is_same_contract: bool = False           # exact match on strike + expiry + option_type
     is_same_expiry: bool = False             # same expiry, different strike
     created_at: datetime
+
+
+class LedgerEntry(BaseModel):
+    """A single flow event recorded in the flow ledger."""
+
+    model_config = {"extra": "forbid"}
+
+    id: str
+    signal_id: str
+    alert_id: str
+    ticker: str
+    strike: float
+    expiry: str
+    option_type: str
+    direction: str
+    premium: float
+    volume: int = 0
+    open_interest: int | None = None
+    execution_type: str | None = None
+    underlying_price: float | None = None
+    implied_volatility: float | None = None
+    is_same_contract: bool = False
+    is_same_expiry: bool = False
+    source: str = "scanner"
+    created_at: datetime
+    recorded_at: datetime
+
+
+class LedgerAggregate(BaseModel):
+    """Summary statistics from the flow ledger for a single signal."""
+
+    model_config = {"extra": "forbid"}
+
+    signal_id: str
+    total_entries: int = 0
+    total_premium: float = 0.0
+    distinct_days: int = 0
+    same_contract_count: int = 0
+    same_expiry_count: int = 0
+    different_expiry_count: int = 0
+    distinct_strikes: int = 0
+    distinct_expiries: int = 0
+    sweep_count: int = 0
+    block_count: int = 0
+    latest_entry_at: datetime | None = None
+    earliest_entry_at: datetime | None = None

@@ -72,8 +72,19 @@ async def _process_scored_trade(
         )
         return
 
-    # Check for duplicate (same contract already being tracked)
     option_type = "call" if candidate.direction == "bullish" else "put"
+
+    # One monitored signal per ticker — second strike enriches via flow ledger, not a new row
+    if await store.has_active_signal_for_ticker(candidate.ticker):
+        log.info(
+            "signal_intake.ticker_already_tracked",
+            ticker=candidate.ticker,
+            strike=candidate.strike,
+            expiry=candidate.expiry,
+        )
+        return
+
+    # Check for duplicate (same contract already being tracked)
     is_dup = await store.check_duplicate_signal(
         candidate.ticker, candidate.strike, candidate.expiry
     )

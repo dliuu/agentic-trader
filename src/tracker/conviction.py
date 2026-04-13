@@ -15,6 +15,7 @@ from tracker.config import TrackerConfig
 from tracker.models import (
     ChainPollResult,
     FlowWatchResult,
+    LedgerAggregate,
     Signal,
     SignalSnapshot,
     SignalState,
@@ -61,6 +62,7 @@ class ConvictionEngine:
         chain: ChainPollResult,
         flow: FlowWatchResult,
         prev_snapshot: SignalSnapshot | None,
+        ledger_aggregate: LedgerAggregate | None = None,
     ) -> ConvictionResult:
         """Evaluate one poll cycle of evidence.
 
@@ -69,6 +71,7 @@ class ConvictionEngine:
             chain: Fresh chain data from the poller.
             flow: New flow events from the watcher.
             prev_snapshot: The previous snapshot (None if first poll).
+            ledger_aggregate: Optional flow_ledger stats (multi-day accumulation, etc.).
 
         Returns:
             ConvictionResult with delta, fired signals, and recommended next state.
@@ -89,10 +92,10 @@ class ConvictionEngine:
         # --- Positive signals ---
         if chain.contract_found and chain.contract_oi is not None:
             self._score_oi_change(signal, chain, prev_snapshot, result)
-        self._score_new_flow(signal, flow, result)
+        self._score_new_flow(signal, flow, result, ledger_aggregate)
         self._score_chain_spread(chain, prev_snapshot, result)
         self._score_put_call_shift(signal, chain, result)
-        self._score_premium_accumulation(signal, flow, result)
+        self._score_premium_accumulation(signal, flow, result, ledger_aggregate)
 
         # --- Negative signals ---
         if chain.contract_found:
@@ -193,28 +196,35 @@ class ConvictionEngine:
         signal: Signal,
         flow: FlowWatchResult,
         result: ConvictionResult,
+        ledger_agg: LedgerAggregate | None = None,
     ) -> None:
         """Score new unusual flow events on the signal's ticker."""
-        if not flow.events:
-            return
+        if flow.events:
+            s = self._scoring
+            bonus = min(
+                len(flow.events) * s.confirming_flow_bonus,
+                s.confirming_flow_cap,
+            )
+            result.conviction_delta += bonus
 
-        s = self._scoring
-        bonus = min(
-            len(flow.events) * s.confirming_flow_bonus,
-            s.confirming_flow_cap,
-        )
-        result.conviction_delta += bonus
+            same_contract = sum(1 for e in flow.events if e.is_same_contract)
+            if same_contract > 0:
+                result.signals_fired.append(f"flow_same_contract_{same_contract}")
+            same_expiry = sum(1 for e in flow.events if e.is_same_expiry)
+            if same_expiry > 0:
+                result.signals_fired.append(f"flow_same_expiry_{same_expiry}")
+            result.signals_fired.append(f"new_flow_{len(flow.events)}_events")
 
-        same_contract = sum(1 for e in flow.events if e.is_same_contract)
-        if same_contract > 0:
-            result.signals_fired.append(f"flow_same_contract_{same_contract}")
-        same_expiry = sum(1 for e in flow.events if e.is_same_expiry)
-        if same_expiry > 0:
-            result.signals_fired.append(f"flow_same_expiry_{same_expiry}")
-        result.signals_fired.append(f"new_flow_{len(flow.events)}_events")
+            # Reset silence counter
+            result.days_without_flow = 0
 
-        # Reset silence counter
-        result.days_without_flow = 0
+        if ledger_agg is not None:
+            if ledger_agg.distinct_days >= 2:
+                result.conviction_delta += 3.0
+                result.signals_fired.append(f"multi_day_accumulation_{ledger_agg.distinct_days}d")
+            if ledger_agg.distinct_strikes >= 3:
+                result.conviction_delta += 2.0
+                result.signals_fired.append(f"strike_spread_{ledger_agg.distinct_strikes}_strikes")
 
     def _score_chain_spread(
         self,
@@ -265,14 +275,18 @@ class ConvictionEngine:
         signal: Signal,
         flow: FlowWatchResult,
         result: ConvictionResult,
+        ledger_agg: LedgerAggregate | None = None,
     ) -> None:
         """Bonus if cumulative premium across all flow exceeds 2x initial."""
         new_premium = sum(e.premium for e in flow.events)
-        total = signal.cumulative_premium + new_premium
-        if signal.initial_premium > 0 and total > 2.0 * signal.initial_premium:
+        if ledger_agg is not None and ledger_agg.total_entries > 0:
+            total_premium = ledger_agg.total_premium
+        else:
+            total_premium = signal.cumulative_premium + new_premium
+        if signal.initial_premium > 0 and total_premium > 2.0 * signal.initial_premium:
             result.conviction_delta += self._scoring.premium_accumulation_bonus
             result.signals_fired.append(
-                f"premium_accumulated_{total / signal.initial_premium:.1f}x"
+                f"premium_accumulated_{total_premium / signal.initial_premium:.1f}x"
             )
 
     # ─── Negative scoring ───

@@ -9,7 +9,7 @@ A multi-gate pipeline for unusual options flow:
 - **Gate 2 (Volatility Analyst + Risk Analyst)** — Deterministic “is the buyer getting a good deal?” layer **after** Gate 1.5. The **Volatility Analyst** fetches 4 UW volatility/chain endpoints per candidate (no LLM), and the **Risk Analyst** scores structural conviction from buyer risk accepted (premium, DTE, spread, OTM distance, move ratio, liquidity, earnings proximity). Gate 2 passes when the average of (**unchanged** Gate 1 flow `SubScore`, vol, risk) meets the configured threshold.
 - **Gate 3 (Specialists + synthesis)** — Runs **Sentiment Analyst**, **Insider Tracker**, and a deterministic **Sector Analyst** in parallel (each emits a `SubScore`). Those scores are merged with Gate 1–2 sub-scores into a **deterministic aggregator** (weighted average, disagreement, six conflict detectors). The **flow analyst** `SubScore` here is still the **raw Gate 1 score** (Gate 1.5 only gates progression; it does not rewrite the sub-score passed to aggregation). A final **Synthesis** step makes **one** Claude call to produce the 1–100 score, applies deterministic caps, merges position sizing with the risk analyst, and emits a passing `ScoredTrade` if the score meets the threshold. See [Synthesis layer (Gate 3)](#synthesis-layer-gate-3) and the specialist sections below.
 
-**Key features:** Confluence enrichment (dark pool + market tide), **Gate 0** universe filter (static lists + cached UW stock info), deterministic **Gates 1 → 1.5 → 2** before most LLM spend (Gate 1.5 adds a small UW footprint but avoids expensive Gates 2–3 on “explained” flow), Gate 3 uses three specialist calls plus one synthesis call (not the legacy single-shot context grader in production), optional `GATE0_ALLOW_LIST` for a focused ticker set, `--force` to bypass market hours, `--max-cycles` for limited runs, dual logging (terminal + `scanner.json.log`), grader pass-through mode (`grader.enabled: false`), audit logging to SQLite (`flow_scores` + `grades`), and a **signal tracker** package (`src/tracker/`) with YAML-backed `TrackerConfig`, Pydantic models (`Signal`, snapshots, chain/flow result types), **`ChainPoller`** (UW `/api/stock/{ticker}/option-chains`), **`FlowWatcher`** (UW flow alerts plus optional scanner `candidates` DB), deterministic **`ConvictionEngine`**, **`run_signal_intake`** / **`run_monitor`** wired from **`scanner.run_pipeline`** when **`tracker.enabled`**, and `SignalStore` on **`signals`** / **`signal_snapshots`** in `data/trades.db` (see [Signal Tracker](#signal-tracker)).
+**Key features:** Confluence enrichment (dark pool + market tide), **Gate 0** universe filter (static lists + cached UW stock info), deterministic **Gates 1 → 1.5 → 2** before most LLM spend (Gate 1.5 adds a small UW footprint but avoids expensive Gates 2–3 on “explained” flow), Gate 3 uses three specialist calls plus one synthesis call (not the legacy single-shot context grader in production), optional `GATE0_ALLOW_LIST` for a focused ticker set, `--force` to bypass market hours, `--max-cycles` for limited runs, dual logging (terminal + `scanner.json.log`), grader pass-through mode (`grader.enabled: false`), audit logging to SQLite (`flow_scores` + `grades`), and a **signal tracker** package (`src/tracker/`) with YAML-backed `TrackerConfig`, Pydantic models (`Signal`, snapshots, chain/flow result types), **`ChainPoller`** (UW `/api/stock/{ticker}/option-chains`), **`FlowWatcher`** (UW flow alerts, optional scanner `candidates` DB, and **`flow_ledger`** as a third evidence source), **`FlowLedger`** (append-only flow rows for watched tickers), deterministic **`ConvictionEngine`** (optional **`LedgerAggregate`** for multi-day premium and strike spread), **`run_signal_intake`** / **`run_monitor`** wired from **`scanner.run_pipeline`** when **`tracker.enabled`**, **one monitored signal per ticker** at intake (pilot: extra strikes enrich the existing signal via the ledger, not a second row), and `SignalStore` on **`signals`** / **`signal_snapshots`** / **`flow_ledger`** in `data/trades.db` (see [Signal Tracker](#signal-tracker)).
 
 ### Quick run (full pipeline)
 
@@ -59,6 +59,7 @@ See [Getting Started](#getting-started) for venv setup, `.env`, and all run mode
 - [Configuration Reference](#configuration-reference)
 - [Grader Configuration](#grader-configuration)
 - [Signal Tracker](#signal-tracker)
+  - [Flow ledger and watched-ticker scan path](#flow-ledger-and-watched-ticker-scan-path)
 - [Observability](#observability)
 - [Testing](#testing)
 - [Deployment](#deployment)
@@ -202,7 +203,7 @@ At a high level, the pipeline is:
 6. **Gate 2 (Volatility Analyst + Risk Analyst)** runs in parallel and determines whether the buyer is paying fair implied volatility relative to the ticker’s own history, sector peers, and the broader market. Gate 2 is deterministic and designed to be low-latency. The **flow** leg of the Gate 2 average is still the **original Gate 1** `SubScore` (Gate 1.5 does not mutate it).
 7. **Gate 3** runs three specialists in parallel (**Sentiment**, **Insider**, **Sector**), each producing a `SubScore` (failures become skipped neutral scores so the pipeline continues). Insider Tracker may skip its LLM when there is no qualifying data (see [Insider Tracker (Gate 3)](#insider-tracker-gate-3)).
 8. **Aggregation + synthesis** (when `grader.enabled` is true) merges all six sub-scores (flow, vol, risk, sentiment, insider, sector), computes a renormalized weighted average, population stdev, agreement label, and conflict flags (`grader.aggregator`). **Synthesis** (`grader.synthesis`) builds a dedicated prompt (`grader.synthesis_prompt`), calls Claude once, parses JSON, applies deterministic score caps, sets verdict from the final score (≥70 pass), sets `TradeRiskParams.recommended_position_size` to `min(LLM modifier, risk analyst size)`, logs every outcome to `grades` in `data/trades.db`, and enqueues a `ScoredTrade` only if the final score ≥ `grader.score_threshold`.
-9. **Signal tracker (`tracker.enabled`)** — **`scanner.run_pipeline`** wraps tasks in a shared **`httpx.AsyncClient`** and, when enabled, runs **`run_signal_intake(scored_queue)`** alongside the grader. Intake creates **`Signal`** rows (capacity + dedup checks) from each **`ScoredTrade`**. **`run_monitor`** loads active signals, runs **`ChainPoller`** → **`FlowWatcher`** (scanner DB path resolved from **`output.sqlite_db_path`**) → **`ConvictionEngine`**, writes snapshots (subject to **`max_snapshots_per_signal`**), updates the signal row, logs state changes, and **`put`s** newly **`ACTIONABLE`** signals on **`executor_queue`**. **`grader.main.run_grader`** appends **`None`** to **`scored_queue`** after the candidate sentinel so intake shuts down cleanly. **`ConvictionEngine`** remains pure logic (no I/O). Disable the tracker by setting **`tracker.enabled: false`**.
+9. **Signal tracker (`tracker.enabled`)** — **`scanner.run_pipeline`** wraps tasks in a shared **`httpx.AsyncClient`** and, when enabled, runs **`run_signal_intake(scored_queue)`** alongside the grader. Intake creates **`Signal`** rows (capacity + duplicate-contract check + **ticker-level guard**: if the ticker already has a signal in **`pending`**, **`accumulating`**, or **`actionable`**, a second graded trade on a different strike is skipped so follow-on flow is captured on the **existing** signal via the **flow ledger** and monitor, not as a second row). **`run_monitor`** loads active signals, runs **`ChainPoller`** → **`FlowWatcher`** (UW + scanner DB + ledger when enabled) → **`ConvictionEngine`** with **`ledger_aggregate`**, persists watcher flow to **`flow_ledger`**, writes snapshots (subject to **`max_snapshots_per_signal`**), updates the signal row, logs state changes, and **`put`s** newly **`ACTIONABLE`** signals on **`executor_queue`**. **`grader.main.run_grader`** appends **`None`** to **`scored_queue`** after the candidate sentinel so intake shuts down cleanly. **`ConvictionEngine`** remains pure logic (no I/O). Disable the tracker by setting **`tracker.enabled: false`**.
 10. **Legacy `Grader` class** (`grader.grader`) — older single-shot “context builder → one LLM” path kept for unit tests; **production** `grader.main` uses `run_gate3` + `SynthesisAgent` instead.
 
 ---
@@ -648,7 +649,7 @@ whale-scanner/
 │   │   ├── filters.py            # Gate thresholds, ExplainabilityConfig, AgentWeights, InsiderScoringConfig, flow/vol/risk configs
 │   │   ├── models.py             # Candidate, SignalMatch, FlowCandidate, SubScore, RiskConvictionScore
 │   │   ├── finnhub_client.py     # Async Finnhub REST (insider transactions + MSPR)
-│   │   ├── db.py                 # SQLite connection + grades/scans/executions/flow_scores/signals tables
+│   │   ├── db.py                 # SQLite connection + grades/scans/executions/flow_scores/signals/flow_ledger tables
 │   │   └── config.py             # YAML loader + env injection
 │   ├── scanner/
 │   │   ├── __init__.py
@@ -680,11 +681,12 @@ whale-scanner/
 │   │   ├── config.py             # TrackerConfig + load_tracker_config (rules.yaml `tracker:`)
 │   │   ├── models.py             # Signal, SignalSnapshot, ChainPollResult, FlowWatchResult, etc.
 │   │   ├── chain_poller.py       # ChainPoller → ChainPollResult (UW option-chains)
-│   │   ├── flow_watcher.py       # FlowWatcher → FlowWatchResult (UW flow + optional scanner DB)
-│   │   ├── conviction.py         # ConvictionEngine — deterministic scoring + state machine
-│   │   ├── intake.py             # run_signal_intake — ScoredTrade → Signal
-│   │   ├── monitor.py            # run_monitor — poll loop + snapshots + executor_queue
-│   │   └── signal_store.py       # SignalStore CRUD for signals + snapshots
+│   │   ├── flow_watcher.py       # FlowWatcher → FlowWatchResult (UW + scanner DB + flow_ledger)
+│   │   ├── flow_ledger.py        # FlowLedger — append-only ledger + aggregate for watched tickers
+│   │   ├── conviction.py         # ConvictionEngine — deterministic scoring + state machine (+ ledger agg)
+│   │   ├── intake.py             # run_signal_intake — ScoredTrade → Signal (ticker + contract dedup)
+│   │   ├── monitor.py            # run_monitor — poll loop + ledger writes + snapshots + executor_queue
+│   │   └── signal_store.py       # SignalStore CRUD for signals + snapshots + watched-ticker helpers
 │   └── grader/
 │       ├── __init__.py
 │       ├── main.py               # Consumer loop: candidate_queue → scored_queue
@@ -748,6 +750,7 @@ whale-scanner/
 │   ├── test_signal_store.py      # SignalStore SQLite (uses temp DB via fixture)
 │   ├── test_chain_poller.py      # ChainPoller + respx mocks
 │   ├── test_flow_watcher.py      # FlowWatcher + respx mocks
+│   ├── test_flow_ledger.py       # FlowLedger record/dedup/aggregate/purge
 │   └── test_conviction.py        # ConvictionEngine (no I/O)
 ├── scripts/
 │   ├── backfill.py
@@ -881,6 +884,7 @@ The `DedupCache` prevents the same trade from being flagged across consecutive p
 - `grades` — every synthesis outcome (and legacy grader runs in tests): candidate_id, score, verdict, rationale, model, token counts, latency
 - `signals` — one row per tracked anomaly (contract, conviction, flow/OI aggregates, lifecycle state); `grade_id` references `grades(id)`
 - `signal_snapshots` — time-series observations per signal (contract/neighborhood metrics, flow deltas, conviction delta/after, `signals_fired` JSON)
+- `flow_ledger` — append-only flow events for **watched** tickers (deduped by **`alert_id`**); scanner bypass path and monitor can both write; used for aggregates in conviction
 
 ---
 
@@ -943,20 +947,63 @@ The **signal tracker** is a peer package under `src/tracker/` for **stateful mon
 
 | Piece | Location | Role |
 |-------|----------|------|
-| Configuration | `config/rules.yaml` → `tracker:` | Polling cadence, monitoring window, capacity caps, actionable/decay thresholds, neighbor radii, per-cycle scoring weights |
-| Typed config | `tracker.config` | `TrackerConfig`, `ConvictionScoringConfig`, `load_tracker_config(dict)` |
-| Domain models | `tracker.models` | `Signal`, `SignalSnapshot`, enums/constants, plus chain/flow DTOs |
-| Intake | `tracker.intake.run_signal_intake` | Async consumer of **`scored_queue`**; creates **`Signal`** rows (`PENDING`), honors **`max_active_signals`** + duplicate contract check |
-| Monitor | `tracker.monitor.run_monitor` | Interval from **`MarketClock`** + `poll_interval_*`; per active signal: poll chain, watch flow, **`ConvictionEngine.evaluate`**, snapshot cap, DB update, **`executor_queue`** on first **`ACTIONABLE`** |
+| Configuration | `config/rules.yaml` → `tracker:` | Polling cadence, monitoring window, capacity caps, actionable/decay thresholds, neighbor radii, per-cycle scoring weights; **`tracker.ledger`** (`enabled`, `purge_terminal_signals`, `retention_days`) |
+| Typed config | `tracker.config` | `TrackerConfig`, `LedgerConfig`, `ConvictionScoringConfig`, `load_tracker_config(dict)` |
+| Domain models | `tracker.models` | `Signal`, `SignalSnapshot`, **`LedgerEntry`**, **`LedgerAggregate`**, enums/constants, plus chain/flow DTOs |
+| Intake | `tracker.intake.run_signal_intake` | Async consumer of **`scored_queue`**; creates **`Signal`** rows (`PENDING`), honors **`max_active_signals`**, **skips if ticker already monitored** (`pending` / `accumulating` / `actionable`), then duplicate **contract** check |
+| Monitor | `tracker.monitor.run_monitor` | Interval from **`MarketClock`** + `poll_interval_*`; per active signal: poll chain, watch flow (including ledger), **append flow events to `flow_ledger`**, **`ledger.aggregate`** → **`ConvictionEngine.evaluate(..., ledger_aggregate=...)`**, retention/terminal purge when configured, snapshot cap, DB update, **`executor_queue`** on first **`ACTIONABLE`** |
 | Chain poller | `tracker.chain_poller.ChainPoller` | One UW call per poll to `/api/stock/{ticker}/option-chains`; `uw_get_json(..., use_cache=False)` |
-| Flow watcher | `tracker.flow_watcher.FlowWatcher` | UW flow alerts + optional scanner **`candidates`** DB (`output.sqlite_db_path` resolved to an absolute path in **`run_pipeline`**) |
-| Conviction engine | `tracker.conviction.ConvictionEngine` | Pure scoring + state recommendation; no network or DB |
+| Flow ledger | `tracker.flow_ledger.FlowLedger` | `record` / `record_batch` (`INSERT OR IGNORE` on **`alert_id`**), `aggregate`, `purge_terminal`, retention purge |
+| Flow watcher | `tracker.flow_watcher.FlowWatcher` | UW flow alerts + optional scanner **`candidates`** DB + **`_fetch_ledger_entries`** when ledger is wired (`output.sqlite_db_path` resolved in **`run_pipeline`**) |
+| Scanner | `scanner.main` | When tracker+ledger enabled: splits flow alerts into **discovery** (dedup → engine → grade path) vs **watched** (writes **`flow_ledger`**; supplemental per-ticker UW fetch for sub-threshold flow) |
+| Conviction engine | `tracker.conviction.ConvictionEngine` | Pure scoring + state recommendation; optional **`ledger_aggregate`** boosts confirming-flow and premium-accumulation scoring |
 | Pipeline wiring | `scanner.run_pipeline.main` | `async with httpx.AsyncClient` → `asyncio.gather(run_scanner, run_grader, [intake, monitor])`; passes **`max_cycles`** into **`run_monitor`** for bounded test runs |
 | Grader sentinel | `grader.main.run_grader` | After the candidate **`None`** sentinel, **`await scored_queue.put(None)`** so intake exits |
-| Persistence | `tracker.signal_store.SignalStore` | Async SQLite CRUD for **`signals`** / **`signal_snapshots`** |
-| Schema | `shared.db._ensure_tables` | `signals` + `signal_snapshots` (+ indexes) alongside grader tables |
+| Persistence | `tracker.signal_store.SignalStore` | Async SQLite CRUD for **`signals`** / **`signal_snapshots`**; **`get_watched_tickers`**, **`get_ticker_signal_map`**, **`has_active_signal_for_ticker`** for scanner/intake |
+| Schema | `shared.db._ensure_tables` | `signals`, `signal_snapshots`, **`flow_ledger`** (+ indexes, **`UNIQUE(alert_id)`**) alongside grader tables |
 
 Load the tracker section after parsing YAML: `load_tracker_config(load_config(...))`.
+
+### Flow ledger and watched-ticker scan path
+
+**Pilot policy:** at most **one** monitored signal per ticker while a position is building. Intake rejects a new **`ScoredTrade`** when the ticker already has a signal in **`pending`**, **`accumulating`**, or **`actionable`** (in addition to the existing same-contract duplicate check). Additional unusual flow on other strikes is meant to show up in **`flow_ledger`** and conviction aggregates, not as a second **`signals`** row.
+
+End-to-end data flow (scanner + tracker with ledger enabled):
+
+```
+UW API: flow alerts (every 30s)
+         │
+         ▼
+    ┌─────────┐        ┌──────────────────────┐
+    │ Scanner │───────▶│ Is ticker watched?    │
+    └─────────┘        └──────────────────────┘
+                          │              │
+                         NO             YES
+                          │              │
+                          ▼              ▼
+                    ┌──────────┐   ┌──────────────┐
+                    │ Dedup    │   │ Flow ledger   │  ← bypass dedup + filters
+                    │ Filter   │   │ record_batch()│
+                    │ Grade    │   └──────────────┘
+                    └──────────┘         │
+                          │              │  (entries accumulate over days)
+                          ▼              │
+                    ┌──────────┐         │
+                    │ Signal   │         │
+                    │ intake   │         │
+                    └──────────┘         │
+                          │              │
+                          ▼              ▼
+                    ┌──────────────────────────┐
+                    │ Monitor loop (every 5 min)│
+                    │                          │
+                    │  chain_poller.poll()      │
+                    │  flow_watcher.check() ◄───┼── also reads ledger
+                    │  ledger.aggregate()       │◄── aggregate stats
+                    │  conviction.evaluate()    │◄── uses aggregate
+                    │  snapshot + update        │
+                    └──────────────────────────┘
+```
 
 ### Integration note
 
@@ -1025,13 +1072,13 @@ python -m pytest tests/test_risk_analyst.py -v --tb=short
 # Gate 0 universe filter
 python -m pytest tests/test_gate0.py -v --tb=short
 
-# Signal tracker (models + SignalStore + chain poller + flow watcher); set PYTHONPATH=src if imports fail
-PYTHONPATH=src python -m pytest tests/test_tracker_models.py tests/test_signal_store.py tests/test_chain_poller.py tests/test_flow_watcher.py tests/test_conviction.py -v
+# Signal tracker (models + SignalStore + chain poller + flow watcher + flow ledger)
+python -m pytest tests/test_tracker_models.py tests/test_signal_store.py tests/test_chain_poller.py tests/test_flow_watcher.py tests/test_flow_ledger.py tests/test_conviction.py -v
 ```
 
-Ensure the venv is activated and the project is installed (`pip install -e ".[dev,grader]"`). Pytest is configured with `pythonpath = ["."]` in `pyproject.toml` so imports like `tests.fixtures.*` resolve when running from the repo root.
+Install the project editable plus test (or dev) extras so `respx` and `pytest-asyncio` are present: `pip install -e ".[test,grader]"` (minimal for CI) or `pip install -e ".[dev,grader]"` (includes ruff/mypy). Pytest is configured with `pythonpath = ["src", "."]` in `pyproject.toml` so `grader`, `scanner`, `shared`, and `tracker` import from `src/` without setting `PYTHONPATH` manually.
 
-Notable suites: `tests/test_gate0.py`, `tests/test_gate1_5.py`, `tests/test_sector_cache.py`, `tests/test_vol_analyst.py`, `tests/test_risk_analyst.py`, `tests/test_sector_analyst.py`, `tests/test_sentiment_analyst.py`, `tests/test_insider_tracker.py`, `tests/test_flow_analyst.py`, `tests/test_tracker_models.py`, `tests/test_signal_store.py`, `tests/test_chain_poller.py`, `tests/test_flow_watcher.py`, `tests/test_conviction.py`.
+Notable suites: `tests/test_gate0.py`, `tests/test_gate1_5.py`, `tests/test_sector_cache.py`, `tests/test_vol_analyst.py`, `tests/test_risk_analyst.py`, `tests/test_sector_analyst.py`, `tests/test_sentiment_analyst.py`, `tests/test_insider_tracker.py`, `tests/test_flow_analyst.py`, `tests/test_tracker_models.py`, `tests/test_signal_store.py`, `tests/test_chain_poller.py`, `tests/test_flow_watcher.py`, `tests/test_flow_ledger.py`, `tests/test_conviction.py`.
 
 If your default `python` is not 3.11+, run tests with `python3.11 -m pytest ...` (project requires Python 3.11+).
 
@@ -1100,7 +1147,7 @@ Optional **`grader`** extra: `anthropic` (Claude SDK).
 
 **Console scripts** (after `pip install -e .`): `whale-scanner` → `scanner.main:main`, `whale-pipeline` → `scanner.run_pipeline:cli`.
 
-Dev: `pytest`, `pytest-asyncio`, `respx`, `ruff`, `mypy`.
+**`test`** extra: `pytest`, `pytest-asyncio`, `respx` (CI uses `pip install -e ".[test,grader]"`). **`dev`** extra: same as `test` plus `ruff`, `mypy`.
 
 ---
 

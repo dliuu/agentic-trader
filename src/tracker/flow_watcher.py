@@ -19,6 +19,7 @@ import structlog
 
 from shared.uw_http import uw_get
 from shared.uw_validation import uw_auth_headers
+from tracker.flow_ledger import FlowLedger
 from tracker.models import FlowEvent, FlowWatchResult, Signal
 
 log = structlog.get_logger()
@@ -34,10 +35,13 @@ class FlowWatcher:
         client: httpx.AsyncClient,
         api_token: str,
         scanner_db_path: str | None = None,
+        *,
+        flow_ledger: FlowLedger | None = None,
     ):
         self._client = client
         self._headers = uw_auth_headers(api_token)
         self._scanner_db_path = scanner_db_path
+        self._flow_ledger = flow_ledger
 
     async def check(self, signal: Signal) -> FlowWatchResult:
         """Check for new flow events on the signal's ticker.
@@ -58,10 +62,13 @@ class FlowWatcher:
         # Source 2: Scanner candidates table
         scanner_events = await self._fetch_scanner_candidates(signal, cutoff)
 
+        # Source 3: Flow ledger (sub-threshold scanner flow already persisted)
+        ledger_events = await self._fetch_ledger_entries(signal, cutoff)
+
         # Merge and deduplicate by alert_id
         seen_ids: set[str] = set()
         merged: list[FlowEvent] = []
-        for event in uw_events + scanner_events:
+        for event in uw_events + scanner_events + ledger_events:
             if event.alert_id not in seen_ids:
                 seen_ids.add(event.alert_id)
                 merged.append(event)
@@ -233,6 +240,43 @@ class FlowWatcher:
             ))
 
         return events
+
+    async def _fetch_ledger_entries(
+        self, signal: Signal, cutoff: datetime
+    ) -> list[FlowEvent]:
+        """Load ledger rows for this signal since cutoff as FlowEvents."""
+        if self._flow_ledger is None:
+            return []
+        try:
+            entries = await self._flow_ledger.get_entries(signal.id, since=cutoff)
+        except Exception as exc:
+            log.warning(
+                "flow_watcher.ledger_read_failed",
+                signal_id=signal.id,
+                error=str(exc),
+            )
+            return []
+        out: list[FlowEvent] = []
+        for le in entries:
+            created = le.created_at
+            if created.tzinfo is None:
+                created = created.replace(tzinfo=timezone.utc)
+            ft = (le.execution_type or "").lower() or None
+            out.append(
+                FlowEvent(
+                    alert_id=le.alert_id,
+                    strike=le.strike,
+                    expiry=le.expiry,
+                    option_type=le.option_type,
+                    premium=le.premium,
+                    volume=le.volume,
+                    fill_type=ft,
+                    is_same_contract=le.is_same_contract,
+                    is_same_expiry=le.is_same_expiry,
+                    created_at=created,
+                )
+            )
+        return out
 
     @staticmethod
     def _parse_float(v: Any) -> float | None:

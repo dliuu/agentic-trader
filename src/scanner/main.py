@@ -32,6 +32,9 @@ from scanner.utils.logging import setup_logging
 from shared.config import load_config
 from shared.uw_runtime import get_uw_limiter
 from shared.uw_validation import UWTokenError, bootstrap_uw_runtime_from_config, require_uw_api_token
+from tracker.config import load_tracker_config
+from tracker.flow_ledger import FlowLedger, ledger_entry_from_flow_alert
+from tracker.signal_store import SignalStore
 
 load_dotenv()
 logger = structlog.get_logger()
@@ -147,8 +150,81 @@ async def run_scanner(
                 if not _cycle_has_429(raw_a, raw_d, raw_t) and errors == 0:
                     poll_backoff = max(poll_backoff / 1.25, 1.0)
 
-                new_alerts = []
+                tracker_cfg = load_tracker_config(config)
+                ledger_on = tracker_cfg.enabled and tracker_cfg.ledger.enabled
+                ticker_signal_map: dict[str, str] = {}
+                signal_by_ticker: dict[str, object] = {}
+                if ledger_on:
+                    try:
+                        sig_store = SignalStore()
+                        ticker_signal_map = await sig_store.get_ticker_signal_map()
+                        for t, sid in ticker_signal_map.items():
+                            sig = await sig_store.get_signal(sid)
+                            if sig is not None:
+                                signal_by_ticker[t] = sig
+                    except Exception as exc:
+                        logger.warning("scanner.watched_map_failed", error=str(exc))
+                        ticker_signal_map = {}
+                        signal_by_ticker = {}
+
+                watched_set = set(ticker_signal_map.keys())
+                watched_by_id: dict[str, object] = {}
                 for alert in alerts:
+                    if alert.ticker.upper() in watched_set:
+                        watched_by_id[alert.id] = alert
+
+                if ledger_on and watched_set:
+                    for t in list(watched_set):
+                        try:
+                            extra = await client.get_flow_alerts(
+                                is_otm=False,
+                                min_premium=1,
+                                size_greater_oi=False,
+                                limit=100,
+                                ticker=t,
+                            )
+                            for a in extra:
+                                watched_by_id[a.id] = a
+                        except Exception as exc:
+                            logger.warning(
+                                "scanner.watched_supplement_fetch_failed",
+                                ticker=t,
+                                error=str(exc),
+                            )
+
+                watched_alerts = list(watched_by_id.values())
+                discovery_alerts = [a for a in alerts if a.ticker.upper() not in watched_set]
+
+                if ledger_on and watched_alerts:
+                    try:
+                        ledger = FlowLedger()
+                        entries = []
+                        for alert in watched_alerts:
+                            t = alert.ticker.upper()
+                            sid = ticker_signal_map.get(t)
+                            sig = signal_by_ticker.get(t)
+                            if not sid or sig is None:
+                                continue
+                            entries.append(
+                                ledger_entry_from_flow_alert(
+                                    alert,
+                                    signal_id=sid,
+                                    signal=sig,
+                                    source="scanner",
+                                )
+                            )
+                        if entries:
+                            await ledger.record_batch(entries)
+                            logger.info(
+                                "scanner.flow_ledger_batch",
+                                rows=len(entries),
+                                tickers=len(watched_set),
+                            )
+                    except Exception as exc:
+                        logger.warning("scanner.flow_ledger_failed", error=str(exc))
+
+                new_alerts = []
+                for alert in discovery_alerts:
                     key_data = {
                         "ticker": alert.ticker,
                         "strike": alert.strike,

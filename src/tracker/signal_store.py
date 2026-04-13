@@ -10,6 +10,7 @@ import structlog
 from shared.db import get_db
 from tracker.models import (
     ACTIVE_STATES,
+    MONITORING_STATES,
     Signal,
     SignalSnapshot,
     SignalState,
@@ -223,6 +224,58 @@ class SignalStore:
                 f"WHERE ticker = ? AND strike = ? AND expiry = ? "
                 f"AND state IN ({placeholders})",
                 (ticker, strike, expiry),
+            )
+            row = await cursor.fetchone()
+            return (row[0] if row else 0) > 0
+        finally:
+            await db.close()
+
+    def _monitoring_state_placeholders(self) -> tuple[str, tuple[str, ...]]:
+        states = tuple(sorted(s.value for s in MONITORING_STATES))
+        ph = ",".join("?" * len(states))
+        return ph, states
+
+    async def get_watched_tickers(self) -> set[str]:
+        """Tickers with a non-terminal monitored signal (pending, accumulating, or actionable)."""
+        db = await get_db()
+        try:
+            ph, states = self._monitoring_state_placeholders()
+            cursor = await db.execute(
+                f"SELECT DISTINCT ticker FROM signals WHERE state IN ({ph})",
+                states,
+            )
+            rows = await cursor.fetchall()
+            return {str(row[0]).upper() for row in rows if row[0]}
+        finally:
+            await db.close()
+
+    async def get_ticker_signal_map(self) -> dict[str, str]:
+        """{ticker_upper: signal_id} for monitored signals; most recent signal wins per ticker."""
+        db = await get_db()
+        try:
+            ph, states = self._monitoring_state_placeholders()
+            cursor = await db.execute(
+                f"SELECT ticker, id FROM signals WHERE state IN ({ph}) ORDER BY created_at DESC",
+                states,
+            )
+            rows = await cursor.fetchall()
+            out: dict[str, str] = {}
+            for ticker, sid in rows:
+                u = str(ticker).upper() if ticker else ""
+                if u and u not in out:
+                    out[u] = sid
+            return out
+        finally:
+            await db.close()
+
+    async def has_active_signal_for_ticker(self, ticker: str) -> bool:
+        """True if any monitored signal already exists for this ticker (one signal per ticker pilot)."""
+        db = await get_db()
+        try:
+            ph, states = self._monitoring_state_placeholders()
+            cursor = await db.execute(
+                f"SELECT COUNT(*) FROM signals WHERE ticker = ? AND state IN ({ph})",
+                (ticker.upper(),) + states,
             )
             row = await cursor.fetchone()
             return (row[0] if row else 0) > 0
