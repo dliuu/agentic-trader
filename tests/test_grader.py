@@ -226,9 +226,33 @@ async def test_parse_failure_fallback_is_logged(sample_candidate, temp_grade_db)
 
 @respx.mock
 @pytest.mark.asyncio
-async def test_enabled_false_pass_through_skips_llm(sample_candidate, temp_grade_db):
+async def test_enabled_false_pass_through_skips_llm(sample_candidate, temp_grade_db, tmp_path):
     """enabled: false skips LLM calls and puts ScoredTrade with grade=None."""
     _register_uw_routes()
+    respx.get("https://api.unusualwhales.com/api/stock/ACME/info").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "data": {
+                    "issue_type": "Common Stock",
+                    "marketCap": 2_000_000_000,
+                    "sector": "Technology",
+                }
+            },
+        )
+    )
+    respx.get("https://api.unusualwhales.com/api/earnings/ACME").mock(
+        return_value=httpx.Response(200, json={"data": []})
+    )
+    respx.get("https://api.unusualwhales.com/api/news/headlines").mock(
+        return_value=httpx.Response(200, json={"data": []})
+    )
+    respx.get("https://api.unusualwhales.com/api/market/technology/sector-tide").mock(
+        return_value=httpx.Response(
+            200,
+            json={"data": [{"call_put_ratio": 1.0, "callPutRatio": 1.0}]},
+        )
+    )
     config = {
         "grader": {
             "score_threshold": 70,
@@ -240,6 +264,8 @@ async def test_enabled_false_pass_through_skips_llm(sample_candidate, temp_grade
         },
         "uw_api_token": "fake",
         "anthropic_api_key": "fake",
+        "output": {"sqlite_db_path": str(tmp_path / "scanner.db")},
+        "unusual_whales": {},
     }
 
     candidate_queue: asyncio.Queue = asyncio.Queue()

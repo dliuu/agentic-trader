@@ -353,6 +353,90 @@ FLOW_SCORING = FlowScoringConfig()
 
 
 # ──────────────────────────────────────────────
+# EXPLAINABILITY FILTER (Gate 1.5)
+# ──────────────────────────────────────────────
+
+
+@dataclass(frozen=True)
+class ExplainabilityConfig:
+    """All tunable parameters for the Gate 1.5 explainability filter.
+
+    Gate 1.5 applies penalties to the Gate 1 flow score when a trade
+    can be explained by normal market activity.
+    """
+
+    # --- Earnings play detection ---
+    earnings_window_days: int = 7  # flow within N days before earnings
+    earnings_expiry_buffer_days: int = 5  # option expires within N days after earnings
+    earnings_penalty: int = -25
+
+    # --- Hot ticker detection ---
+    hot_ticker_lookback_days: int = 14  # scan window for counting alerts
+    hot_ticker_threshold_1: int = 5  # 5-9 alerts = tier 1
+    hot_ticker_penalty_1: int = -15
+    hot_ticker_threshold_2: int = 10  # 10-19 alerts = tier 2
+    hot_ticker_penalty_2: int = -20
+    hot_ticker_threshold_3: int = 20  # 20+ alerts = tier 3
+    hot_ticker_penalty_3: int = -25
+
+    # --- Sector rotation alignment ---
+    sector_bullish_cp_threshold: float = 1.5  # call/put ratio above this = bullish sector
+    sector_bearish_cp_threshold: float = 0.67  # call/put ratio below this = bearish sector
+    sector_alignment_penalty: int = -10
+
+    # --- Recent catalyst alignment ---
+    catalyst_lookback_hours: int = 48
+    catalyst_alignment_penalty: int = -20
+
+    # --- Penalty cap ---
+    max_total_penalty: int = -50  # floor for cumulative penalty
+
+    # --- Catalyst keywords ---
+    bullish_catalyst_keywords: tuple[str, ...] = (
+        "upgrade",
+        "price target raised",
+        "overweight",
+        "outperform",
+        "buy rating",
+        "initiates coverage",
+        "beats estimates",
+        "revenue surprise",
+        "guidance raised",
+        "acquisition target",
+        "buyout",
+        "takeover target",
+        "fda approval",
+        "breakthrough designation",
+    )
+    bearish_catalyst_keywords: tuple[str, ...] = (
+        "downgrade",
+        "price target lowered",
+        "underweight",
+        "underperform",
+        "sell rating",
+        "misses estimates",
+        "guidance lowered",
+        "guidance cut",
+        "fda reject",
+        "crl",  # complete response letter (FDA rejection)
+    )
+    # Keywords that are catalysts but direction-neutral (penalize either direction)
+    neutral_catalyst_keywords: tuple[str, ...] = (
+        "acquisition",
+        "acquire",
+        "merger",
+        "deal",
+        "pdufa",
+        "analyst",
+        "rating",
+        "coverage",
+    )
+
+
+EXPLAINABILITY_CONFIG = ExplainabilityConfig()
+
+
+# ──────────────────────────────────────────────
 # GATE THRESHOLDS
 # ──────────────────────────────────────────────
 
@@ -364,6 +448,8 @@ class GateThresholds:
 
     # Gate 1: Flow analyst minimum score to proceed
     flow_analyst_min: int = 40
+
+    gate1_5_combined_min: int = 50  # Gate 1 + Gate 1.5 combined minimum
 
     # Gate 2: Average of (flow + vol + risk) minimum to proceed to LLM layer
     gate2_avg_threshold: int = 45

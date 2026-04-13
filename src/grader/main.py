@@ -16,6 +16,7 @@ from grader.agents.sentiment_analyst import SentimentAnalyst
 from grader.context.sentiment_ctx import SentimentContextBuilder
 from grader.gate0 import run_gate0
 from grader.gate1 import run_gate1
+from grader.gate1_5 import run_gate1_5
 from grader.gate2 import run_gate2
 from grader.gate3 import run_gate3
 from grader.llm_client import LLMClient
@@ -41,6 +42,10 @@ async def run_grader(
     if not config_path.exists():
         config_path = Path("config/rules.yaml")
     config = load_config(config_path)
+    scanner_db_path = config["output"]["sqlite_db_path"]
+    if not Path(scanner_db_path).is_absolute():
+        project_root = config_path.resolve().parent.parent
+        scanner_db_path = str(project_root / scanner_db_path)
     grader_cfg = config["grader"]
     uw_cfg = config.get("unusual_whales") or {}
     sector_refresh = float(uw_cfg.get("sector_cache_refresh_seconds", 8 * 3600))
@@ -104,6 +109,26 @@ async def run_grader(
 
             passed_gate1, flow_score = await run_gate1(candidate)
             if not passed_gate1:
+                candidate_queue.task_done()
+                continue
+
+            gate1_5_result = await run_gate1_5(
+                candidate=candidate,
+                flow_score=flow_score,
+                client=http_client,
+                api_token=config["uw_api_token"],
+                scanner_db_path=scanner_db_path,
+                sector=gate0_result.sector,
+            )
+            if not gate1_5_result.passed:
+                log.info(
+                    "pipeline.gate1_5_reject",
+                    ticker=candidate.ticker,
+                    flow_score=flow_score.score,
+                    penalty=gate1_5_result.penalty,
+                    combined=gate1_5_result.combined_score,
+                    reasons=gate1_5_result.reasons,
+                )
                 candidate_queue.task_done()
                 continue
 

@@ -317,12 +317,13 @@ def extract_realized_vol(vol_stats_response: dict | None) -> float | None:
     return None
 
 
-def extract_days_to_earnings(
+def _next_upcoming_earnings(
     earnings_response: dict | None,
     as_of: datetime | None = None,
-) -> int | None:
+) -> tuple[int | None, datetime | None]:
+    """First upcoming earnings in API list order (same semantics as historical extract_days_to_earnings)."""
     if not earnings_response:
-        return None
+        return None, None
     now = as_of or datetime.now(timezone.utc)
     data = earnings_response.get("data", earnings_response)
     entries = data if isinstance(data, list) else [data]
@@ -338,10 +339,27 @@ def extract_days_to_earnings(
                 earnings_date = earnings_date.replace(tzinfo=timezone.utc)
             delta = (earnings_date - now).days
             if delta >= 0:
-                return delta
+                return delta, earnings_date
         except (ValueError, TypeError):
             continue
-    return None
+    return None, None
+
+
+def extract_days_to_earnings(
+    earnings_response: dict | None,
+    as_of: datetime | None = None,
+) -> int | None:
+    d, _ = _next_upcoming_earnings(earnings_response, as_of)
+    return d
+
+
+def extract_next_earnings_datetime(
+    earnings_response: dict | None,
+    as_of: datetime | None = None,
+) -> datetime | None:
+    """UTC datetime of the same next earnings used by extract_days_to_earnings (for Gate 1.5 expiry math)."""
+    _, dt = _next_upcoming_earnings(earnings_response, as_of)
+    return dt
 
 
 def _safe_float(val: Any) -> float | None:
