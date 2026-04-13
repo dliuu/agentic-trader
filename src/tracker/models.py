@@ -262,3 +262,47 @@ class LedgerAggregate(BaseModel):
     block_count: int = 0
     latest_entry_at: datetime | None = None
     earliest_entry_at: datetime | None = None
+
+
+class NewsEventType(str, Enum):
+    """Classification of a news event."""
+
+    HEADLINE = "headline"
+    SEC_FILING = "sec_filing"
+
+
+class NewsEvent(BaseModel):
+    """A single news or filing event detected by the news watcher."""
+
+    model_config = {"extra": "forbid"}
+
+    id: str
+    signal_id: str
+    ticker: str
+    event_type: NewsEventType
+    title: str
+    source: str
+    url: str | None = None
+    published_at: datetime
+    detected_at: datetime
+
+    catalyst_matched: bool = False
+    catalyst_keywords: list[str] = Field(default_factory=list)
+    filing_type: str | None = None
+
+    source_id: str = ""
+
+
+class NewsWatchResult(BaseModel):
+    """Output of a single news watch cycle for one signal."""
+
+    model_config = {"extra": "forbid"}
+
+    signal_id: str
+    ticker: str
+    checked_at: datetime
+    events: list[NewsEvent] = Field(default_factory=list)
+    has_catalyst: bool = False
+    catalyst_types: list[str] = Field(default_factory=list)
+    filing_detected: bool = False
+    regrade_recommended: bool = False

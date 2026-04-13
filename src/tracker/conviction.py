@@ -16,6 +16,7 @@ from tracker.models import (
     ChainPollResult,
     FlowWatchResult,
     LedgerAggregate,
+    NewsWatchResult,
     Signal,
     SignalSnapshot,
     SignalState,
@@ -63,6 +64,7 @@ class ConvictionEngine:
         flow: FlowWatchResult,
         prev_snapshot: SignalSnapshot | None,
         ledger_aggregate: LedgerAggregate | None = None,
+        news: NewsWatchResult | None = None,
     ) -> ConvictionResult:
         """Evaluate one poll cycle of evidence.
 
@@ -72,6 +74,7 @@ class ConvictionEngine:
             flow: New flow events from the watcher.
             prev_snapshot: The previous snapshot (None if first poll).
             ledger_aggregate: Optional flow_ledger stats (multi-day accumulation, etc.).
+            news: Optional news watch result for this cycle (headlines + SEC filings).
 
         Returns:
             ConvictionResult with delta, fired signals, and recommended next state.
@@ -96,6 +99,7 @@ class ConvictionEngine:
         self._score_chain_spread(chain, prev_snapshot, result)
         self._score_put_call_shift(signal, chain, result)
         self._score_premium_accumulation(signal, flow, result, ledger_aggregate)
+        self._score_news(news, result)
 
         # --- Negative signals ---
         if chain.contract_found:
@@ -269,6 +273,26 @@ class ConvictionEngine:
         elif signal.direction == "bearish" and call_ratio < 0.40:
             result.conviction_delta += self._scoring.put_call_shift_bonus
             result.signals_fired.append(f"put_heavy_ratio_{1 - call_ratio:.2f}")
+
+    def _score_news(
+        self,
+        news: NewsWatchResult | None,
+        result: ConvictionResult,
+    ) -> None:
+        """Score news events — catalysts boost conviction, silence is handled elsewhere."""
+        if news is None or not news.events:
+            return
+
+        if news.has_catalyst:
+            result.conviction_delta += 4
+            preview = ",".join(news.catalyst_types[:3])
+            result.signals_fired.append(f"catalyst_detected:{preview}")
+
+        if news.filing_detected:
+            filing_types = [e.filing_type for e in news.events if e.filing_type]
+            result.conviction_delta += 5
+            ft_preview = ",".join(filing_types[:3])
+            result.signals_fired.append(f"sec_filing:{ft_preview}")
 
     def _score_premium_accumulation(
         self,

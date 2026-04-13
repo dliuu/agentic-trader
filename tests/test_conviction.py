@@ -10,6 +10,9 @@ from tracker.models import (
     FlowEvent,
     FlowWatchResult,
     NeighborStrike,
+    NewsEvent,
+    NewsEventType,
+    NewsWatchResult,
     Signal,
     SignalSnapshot,
     SignalState,
@@ -141,6 +144,64 @@ class TestConvictionNegative:
         prev = _make_prev_snapshot(contract_oi=100)
         result = engine.evaluate(signal, chain, _make_flow(), prev)
         assert result.conviction_delta >= -20.0
+
+
+class TestConvictionNews:
+    def test_news_none_backward_compatible(self):
+        engine = ConvictionEngine()
+        signal = _make_signal()
+        chain = _make_chain()
+        flow = _make_flow()
+        prev = _make_prev_snapshot()
+        r1 = engine.evaluate(signal, chain, flow, prev)
+        r2 = engine.evaluate(signal, chain, flow, prev, news=None)
+        assert r1.conviction_delta == r2.conviction_delta
+        assert r1.signals_fired == r2.signals_fired
+
+    def test_catalyst_and_filing_bonuses(self):
+        engine = ConvictionEngine()
+        signal = _make_signal()
+        now = _now()
+        news = NewsWatchResult(
+            signal_id=signal.id,
+            ticker=signal.ticker,
+            checked_at=now,
+            events=[
+                NewsEvent(
+                    id="e1",
+                    signal_id=signal.id,
+                    ticker=signal.ticker,
+                    event_type=NewsEventType.HEADLINE,
+                    title="Merger announced",
+                    source="uw_headlines",
+                    published_at=now,
+                    detected_at=now,
+                    catalyst_matched=True,
+                    catalyst_keywords=["merger"],
+                ),
+                NewsEvent(
+                    id="e2",
+                    signal_id=signal.id,
+                    ticker=signal.ticker,
+                    event_type=NewsEventType.SEC_FILING,
+                    title="8-K: ACME",
+                    source="sec_edgar",
+                    published_at=now,
+                    detected_at=now,
+                    filing_type="8-K",
+                    catalyst_matched=True,
+                    catalyst_keywords=["8-k"],
+                ),
+            ],
+            has_catalyst=True,
+            filing_detected=True,
+        )
+        result = engine.evaluate(
+            signal, _make_chain(), _make_flow(), _make_prev_snapshot(), news=news
+        )
+        assert "catalyst_detected" in " ".join(result.signals_fired)
+        assert any("sec_filing" in s for s in result.signals_fired)
+        assert result.conviction_delta >= 9.0
 
 
 class TestStateTransitions:

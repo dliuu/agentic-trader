@@ -9,7 +9,7 @@ A multi-gate pipeline for unusual options flow:
 - **Gate 2 (Volatility Analyst + Risk Analyst)** — Deterministic “is the buyer getting a good deal?” layer **after** Gate 1.5. The **Volatility Analyst** fetches 4 UW volatility/chain endpoints per candidate (no LLM), and the **Risk Analyst** scores structural conviction from buyer risk accepted (premium, DTE, spread, OTM distance, move ratio, liquidity, earnings proximity). Gate 2 passes when the average of (**unchanged** Gate 1 flow `SubScore`, vol, risk) meets the configured threshold.
 - **Gate 3 (Specialists + synthesis)** — Runs **Sentiment Analyst**, **Insider Tracker**, and a deterministic **Sector Analyst** in parallel (each emits a `SubScore`). Those scores are merged with Gate 1–2 sub-scores into a **deterministic aggregator** (weighted average, disagreement, six conflict detectors). The **flow analyst** `SubScore` here is still the **raw Gate 1 score** (Gate 1.5 only gates progression; it does not rewrite the sub-score passed to aggregation). A final **Synthesis** step makes **one** Claude call to produce the 1–100 score, applies deterministic caps, merges position sizing with the risk analyst, and emits a passing `ScoredTrade` if the score meets the threshold. See [Synthesis layer (Gate 3)](#synthesis-layer-gate-3) and the specialist sections below.
 
-**Key features:** Confluence enrichment (dark pool + market tide), **Gate 0** universe filter (static lists + cached UW stock info), deterministic **Gates 1 → 1.5 → 2** before most LLM spend (Gate 1.5 adds a small UW footprint but avoids expensive Gates 2–3 on “explained” flow), Gate 3 uses three specialist calls plus one synthesis call (not the legacy single-shot context grader in production), optional `GATE0_ALLOW_LIST` for a focused ticker set, `--force` to bypass market hours, `--max-cycles` for limited runs, dual logging (terminal + `scanner.json.log`), grader pass-through mode (`grader.enabled: false`), audit logging to SQLite (`flow_scores` + `grades`), and a **signal tracker** package (`src/tracker/`) with YAML-backed `TrackerConfig`, Pydantic models (`Signal`, snapshots, chain/flow result types), **`ChainPoller`** (UW `/api/stock/{ticker}/option-chains`), **`FlowWatcher`** (UW flow alerts, optional scanner `candidates` DB, and **`flow_ledger`** as a third evidence source), **`FlowLedger`** (append-only flow rows for watched tickers), deterministic **`ConvictionEngine`** (optional **`LedgerAggregate`** for multi-day premium and strike spread), **`run_signal_intake`** / **`run_monitor`** wired from **`scanner.run_pipeline`** when **`tracker.enabled`**, **one monitored signal per ticker** at intake (pilot: extra strikes enrich the existing signal via the ledger, not a second row), and `SignalStore` on **`signals`** / **`signal_snapshots`** / **`flow_ledger`** in `data/trades.db` (see [Signal Tracker](#signal-tracker)).
+**Key features:** Confluence enrichment (dark pool + market tide), **Gate 0** universe filter (static lists + cached UW stock info), deterministic **Gates 1 → 1.5 → 2** before most LLM spend (Gate 1.5 adds a small UW footprint but avoids expensive Gates 2–3 on “explained” flow), Gate 3 uses three specialist calls plus one synthesis call (not the legacy single-shot context grader in production), optional `GATE0_ALLOW_LIST` for a focused ticker set, `--force` to bypass market hours, `--max-cycles` for limited runs, dual logging (terminal + `scanner.json.log`), grader pass-through mode (`grader.enabled: false`), audit logging to SQLite (`flow_scores` + `grades`), and a **signal tracker** package (`src/tracker/`) with YAML-backed `TrackerConfig`, Pydantic models (`Signal`, snapshots, chain/flow result types), **`ChainPoller`** (UW `/api/stock/{ticker}/option-chains`), **`FlowWatcher`** (UW flow alerts, optional scanner `candidates` DB, and **`flow_ledger`** as a third evidence source), **`FlowLedger`** (append-only flow rows for watched tickers), **`NewsWatcher`** (UW `/api/news/headlines` plus SEC EDGAR EFTS on a **4-hour cadence** per signal—see [News watcher](#news-watcher)), SQLite **`news_events`** for deduped catalyst rows, deterministic **`ConvictionEngine`** (optional **`LedgerAggregate`** and optional **`NewsWatchResult`** for headline/filing bonuses), **`run_signal_intake`** / **`run_monitor`** wired from **`scanner.run_pipeline`** when **`tracker.enabled`**, **one monitored signal per ticker** at intake (pilot: extra strikes enrich the existing signal via the ledger, not a second row), and `SignalStore` on **`signals`** / **`signal_snapshots`** / **`flow_ledger`** in `data/trades.db` (see [Signal Tracker](#signal-tracker)).
 
 ### Quick run (full pipeline)
 
@@ -187,7 +187,7 @@ Press **`Ctrl+C`** in the terminal to interrupt the process.
 
 The scanner runs as an async producer: every cycle it fetches flow alerts, dark pool prints, and market tide from the Unusual Whales API, deduplicates, runs the rule engine, enriches with confluence data, persists to SQLite, and pushes candidates into a shared queue. The grader consumer runs **Gate 0** (universe filter), **Gate 1** (flow score + SQLite log), **Gate 1.5** (explainability penalties + combined threshold), then **Gates 2–3**: vol + risk, then parallel specialists, deterministic aggregation, and a single synthesis LLM call (when grading is enabled). Shared code lives in `src/shared/` (models, config, db, filters).
 
-A **signal tracker** peer module in `src/tracker/` turns passing **`ScoredTrade`** outputs into long-lived **`Signal`** rows (**`run_signal_intake`**), polls chains and flow (**`run_monitor`** → `ChainPoller` + `FlowWatcher` + **`ConvictionEngine`**), persists **`SignalSnapshot`** rows, updates SQLite, and enqueues **`ACTIONABLE`** signals on **`executor_queue`** for a future Agent C consumer. Toggle with **`tracker.enabled`** in `config/rules.yaml`. With **`--max-cycles N`**, the monitor runs at most **N** poll cycles so the whole `asyncio.gather` can exit after the scanner stops (in addition to the grader→intake `None` sentinel).
+A **signal tracker** peer module in `src/tracker/` turns passing **`ScoredTrade`** outputs into long-lived **`Signal`** rows (**`run_signal_intake`**), polls chains, flow, and news (**`run_monitor`** → `ChainPoller` + `FlowWatcher` + **`NewsWatcher`** + **`ConvictionEngine`**), persists **`SignalSnapshot`** and optional **`news_events`** rows, updates SQLite, and enqueues **`ACTIONABLE`** signals on **`executor_queue`** for a future Agent C consumer. Toggle with **`tracker.enabled`** in `config/rules.yaml`. With **`--max-cycles N`**, the monitor runs at most **N** poll cycles so the whole `asyncio.gather` can exit after the scanner stops (in addition to the grader→intake `None` sentinel).
 
 ---
 
@@ -203,7 +203,7 @@ At a high level, the pipeline is:
 6. **Gate 2 (Volatility Analyst + Risk Analyst)** runs in parallel and determines whether the buyer is paying fair implied volatility relative to the ticker’s own history, sector peers, and the broader market. Gate 2 is deterministic and designed to be low-latency. The **flow** leg of the Gate 2 average is still the **original Gate 1** `SubScore` (Gate 1.5 does not mutate it).
 7. **Gate 3** runs three specialists in parallel (**Sentiment**, **Insider**, **Sector**), each producing a `SubScore` (failures become skipped neutral scores so the pipeline continues). Insider Tracker may skip its LLM when there is no qualifying data (see [Insider Tracker (Gate 3)](#insider-tracker-gate-3)).
 8. **Aggregation + synthesis** (when `grader.enabled` is true) merges all six sub-scores (flow, vol, risk, sentiment, insider, sector), computes a renormalized weighted average, population stdev, agreement label, and conflict flags (`grader.aggregator`). **Synthesis** (`grader.synthesis`) builds a dedicated prompt (`grader.synthesis_prompt`), calls Claude once, parses JSON, applies deterministic score caps, sets verdict from the final score (≥70 pass), sets `TradeRiskParams.recommended_position_size` to `min(LLM modifier, risk analyst size)`, logs every outcome to `grades` in `data/trades.db`, and enqueues a `ScoredTrade` only if the final score ≥ `grader.score_threshold`.
-9. **Signal tracker (`tracker.enabled`)** — **`scanner.run_pipeline`** wraps tasks in a shared **`httpx.AsyncClient`** and, when enabled, runs **`run_signal_intake(scored_queue)`** alongside the grader. Intake creates **`Signal`** rows (capacity + duplicate-contract check + **ticker-level guard**: if the ticker already has a signal in **`pending`**, **`accumulating`**, or **`actionable`**, a second graded trade on a different strike is skipped so follow-on flow is captured on the **existing** signal via the **flow ledger** and monitor, not as a second row). **`run_monitor`** loads active signals, runs **`ChainPoller`** → **`FlowWatcher`** (UW + scanner DB + ledger when enabled) → **`ConvictionEngine`** with **`ledger_aggregate`**, persists watcher flow to **`flow_ledger`**, writes snapshots (subject to **`max_snapshots_per_signal`**), updates the signal row, logs state changes, and **`put`s** newly **`ACTIONABLE`** signals on **`executor_queue`**. **`grader.main.run_grader`** appends **`None`** to **`scored_queue`** after the candidate sentinel so intake shuts down cleanly. **`ConvictionEngine`** remains pure logic (no I/O). Disable the tracker by setting **`tracker.enabled: false`**.
+9. **Signal tracker (`tracker.enabled`)** — **`scanner.run_pipeline`** wraps tasks in a shared **`httpx.AsyncClient`** and, when enabled, runs **`run_signal_intake(scored_queue)`** alongside the grader. Intake creates **`Signal`** rows (capacity + duplicate-contract check + **ticker-level guard**: if the ticker already has a signal in **`pending`**, **`accumulating`**, or **`actionable`**, a second graded trade on a different strike is skipped so follow-on flow is captured on the **existing** signal via the **flow ledger** and monitor, not as a second row). **`run_monitor`** loads active signals, runs **`ChainPoller`** → **`FlowWatcher`** (UW + scanner DB + ledger when enabled) → **`NewsWatcher.check()`** (UW headlines + SEC EDGAR on **`tracker.news`** intervals; persists **`news_events`**) → **`ConvictionEngine`** with **`ledger_aggregate`** and **`news`**, persists watcher flow to **`flow_ledger`**, writes snapshots (subject to **`max_snapshots_per_signal`**), updates the signal row, logs state changes, and **`put`s** newly **`ACTIONABLE`** signals on **`executor_queue`**. **`grader.main.run_grader`** appends **`None`** to **`scored_queue`** after the candidate sentinel so intake shuts down cleanly. **`ConvictionEngine`** remains pure logic (no I/O). Disable the tracker by setting **`tracker.enabled: false`**.
 10. **Legacy `Grader` class** (`grader.grader`) — older single-shot “context builder → one LLM” path kept for unit tests; **production** `grader.main` uses `run_gate3` + `SynthesisAgent` instead.
 
 ---
@@ -679,13 +679,14 @@ whale-scanner/
 │   ├── tracker/                  # Signal tracker — post-grade monitoring (models, config, SQLite)
 │   │   ├── __init__.py
 │   │   ├── config.py             # TrackerConfig + load_tracker_config (rules.yaml `tracker:`)
-│   │   ├── models.py             # Signal, SignalSnapshot, ChainPollResult, FlowWatchResult, etc.
+│   │   ├── models.py             # Signal, snapshots, chain/flow DTOs, NewsEvent / NewsWatchResult
 │   │   ├── chain_poller.py       # ChainPoller → ChainPollResult (UW option-chains)
 │   │   ├── flow_watcher.py       # FlowWatcher → FlowWatchResult (UW + scanner DB + flow_ledger)
 │   │   ├── flow_ledger.py        # FlowLedger — append-only ledger + aggregate for watched tickers
 │   │   ├── conviction.py         # ConvictionEngine — deterministic scoring + state machine (+ ledger agg)
 │   │   ├── intake.py             # run_signal_intake — ScoredTrade → Signal (ticker + contract dedup)
-│   │   ├── monitor.py            # run_monitor — poll loop + ledger writes + snapshots + executor_queue
+│   │   ├── monitor.py            # run_monitor — poll loop + ledger + news_watcher + snapshots + executor_queue
+│   │   ├── news_watcher.py       # UW headlines + SEC EDGAR EFTS, catalyst + persist news_events
 │   │   └── signal_store.py       # SignalStore CRUD for signals + snapshots + watched-ticker helpers
 │   └── grader/
 │       ├── __init__.py
@@ -809,6 +810,7 @@ Defined in `src/tracker/models.py`. Core types:
 - **`Signal`** — Persistent tracked contract: ticker/strike/expiry/option side, `SignalState` (`pending`, `accumulating`, `actionable`, `executed`, `expired`, `decayed`), grading provenance (`grade_id`, `initial_score`, OI/volume/premium baselines), rolling conviction fields (`conviction_score`, `confirming_flows`, `oi_high_water`, etc.), and optional `risk_params_json` / `anomaly_fingerprint` for downstream execution.
 - **`SignalSnapshot`** — One row per poll cycle: contract quotes/OI, neighborhood aggregates, new-flow counts/premium, and conviction engine output (`conviction_delta`, `conviction_after`, `signals_fired`).
 - **`ChainPollResult`**, **`FlowWatchResult`**, **`NeighborStrike`**, **`AdjacentExpiryOI`**, **`FlowEvent`** — Structured outputs from **`ChainPoller.poll()`** and **`FlowWatcher.check()`**, consumed by **`ConvictionEngine.evaluate()`** (`tracker.conviction`), which emits a **`ConvictionResult`** (delta, fired rule tags, recommended `next_state`, terminal reason when applicable).
+- **`NewsEventType`**, **`NewsEvent`**, **`NewsWatchResult`** — Outputs from **`NewsWatcher.check()`**: headlines and SEC filings since the last poll window, catalyst keyword matches, **`regrade_recommended`** (tier-1 catalyst, qualifying tier-2 volume, or material filing types), and optional persistence to **`news_events`**. Passed into **`ConvictionEngine.evaluate(..., news=...)`** for small conviction boosts when new catalyst or filing evidence appears in-cycle.
 
 ---
 
@@ -885,6 +887,7 @@ The `DedupCache` prevents the same trade from being flagged across consecutive p
 - `signals` — one row per tracked anomaly (contract, conviction, flow/OI aggregates, lifecycle state); `grade_id` references `grades(id)`
 - `signal_snapshots` — time-series observations per signal (contract/neighborhood metrics, flow deltas, conviction delta/after, `signals_fired` JSON)
 - `flow_ledger` — append-only flow events for **watched** tickers (deduped by **`alert_id`**); scanner bypass path and monitor can both write; used for aggregates in conviction
+- `news_events` — deduped rows for **`NewsWatcher`** (UW headline IDs or EDGAR accession numbers in **`source_id`**); timeline for a future re-grader
 
 ---
 
@@ -947,20 +950,21 @@ The **signal tracker** is a peer package under `src/tracker/` for **stateful mon
 
 | Piece | Location | Role |
 |-------|----------|------|
-| Configuration | `config/rules.yaml` → `tracker:` | Polling cadence, monitoring window, capacity caps, actionable/decay thresholds, neighbor radii, per-cycle scoring weights; **`tracker.ledger`** (`enabled`, `purge_terminal_signals`, `retention_days`) |
-| Typed config | `tracker.config` | `TrackerConfig`, `LedgerConfig`, `ConvictionScoringConfig`, `load_tracker_config(dict)` |
-| Domain models | `tracker.models` | `Signal`, `SignalSnapshot`, **`LedgerEntry`**, **`LedgerAggregate`**, enums/constants, plus chain/flow DTOs |
+| Configuration | `config/rules.yaml` → `tracker:` | Polling cadence, monitoring window, capacity caps, actionable/decay thresholds, neighbor radii, per-cycle scoring weights; **`tracker.ledger`** (`enabled`, `purge_terminal_signals`, `retention_days`); **`tracker.news`** (`enabled`, **`headline_interval_seconds`** / **`edgar_interval_seconds`** default **14400**, `edgar_lookback_days`, `edgar_user_agent`) |
+| Typed config | `tracker.config` | `TrackerConfig`, `LedgerConfig`, **`NewsWatcherConfig`**, `ConvictionScoringConfig`, `load_tracker_config(dict)` |
+| Domain models | `tracker.models` | `Signal`, `SignalSnapshot`, **`LedgerEntry`**, **`LedgerAggregate`**, **`NewsEvent`**, **`NewsWatchResult`**, enums/constants, plus chain/flow DTOs |
 | Intake | `tracker.intake.run_signal_intake` | Async consumer of **`scored_queue`**; creates **`Signal`** rows (`PENDING`), honors **`max_active_signals`**, **skips if ticker already monitored** (`pending` / `accumulating` / `actionable`), then duplicate **contract** check |
-| Monitor | `tracker.monitor.run_monitor` | Interval from **`MarketClock`** + `poll_interval_*`; per active signal: poll chain, watch flow (including ledger), **append flow events to `flow_ledger`**, **`ledger.aggregate`** → **`ConvictionEngine.evaluate(..., ledger_aggregate=...)`**, retention/terminal purge when configured, snapshot cap, DB update, **`executor_queue`** on first **`ACTIONABLE`** |
+| Monitor | `tracker.monitor.run_monitor` | Interval from **`MarketClock`** + `poll_interval_*`; per active signal: poll chain, watch flow (including ledger), **`NewsWatcher.check()`** (UW + EDGAR on each source’s interval), persist new **`news_events`**, log **`regrade_recommended`**, **`ledger.aggregate`** → **`ConvictionEngine.evaluate(..., ledger_aggregate=..., news=...)`**, retention/terminal purge when configured, snapshot cap, DB update, **`executor_queue`** on first **`ACTIONABLE`** |
 | Chain poller | `tracker.chain_poller.ChainPoller` | One UW call per poll to `/api/stock/{ticker}/option-chains`; `uw_get_json(..., use_cache=False)` |
 | Flow ledger | `tracker.flow_ledger.FlowLedger` | `record` / `record_batch` (`INSERT OR IGNORE` on **`alert_id`**), `aggregate`, `purge_terminal`, retention purge |
 | Flow watcher | `tracker.flow_watcher.FlowWatcher` | UW flow alerts + optional scanner **`candidates`** DB + **`_fetch_ledger_entries`** when ledger is wired (`output.sqlite_db_path` resolved in **`run_pipeline`**) |
+| News watcher | `tracker.news_watcher.NewsWatcher` | Rate-limited UW headlines; direct **`httpx`** GET to **`efts.sec.gov`** (requires compliant **`User-Agent`**); **`detect_catalysts()`**; dedup via **`news_events`**; **`get_events_for_signal()`** for future re-grader context |
 | Scanner | `scanner.main` | When tracker+ledger enabled: splits flow alerts into **discovery** (dedup → engine → grade path) vs **watched** (writes **`flow_ledger`**; supplemental per-ticker UW fetch for sub-threshold flow) |
-| Conviction engine | `tracker.conviction.ConvictionEngine` | Pure scoring + state recommendation; optional **`ledger_aggregate`** boosts confirming-flow and premium-accumulation scoring |
+| Conviction engine | `tracker.conviction.ConvictionEngine` | Pure scoring + state recommendation; optional **`ledger_aggregate`** and optional **`news`** (`+4` if **`has_catalyst`**, `+5` if SEC filing in-cycle) |
 | Pipeline wiring | `scanner.run_pipeline.main` | `async with httpx.AsyncClient` → `asyncio.gather(run_scanner, run_grader, [intake, monitor])`; passes **`max_cycles`** into **`run_monitor`** for bounded test runs |
 | Grader sentinel | `grader.main.run_grader` | After the candidate **`None`** sentinel, **`await scored_queue.put(None)`** so intake exits |
 | Persistence | `tracker.signal_store.SignalStore` | Async SQLite CRUD for **`signals`** / **`signal_snapshots`**; **`get_watched_tickers`**, **`get_ticker_signal_map`**, **`has_active_signal_for_ticker`** for scanner/intake |
-| Schema | `shared.db._ensure_tables` | `signals`, `signal_snapshots`, **`flow_ledger`** (+ indexes, **`UNIQUE(alert_id)`**) alongside grader tables |
+| Schema | `shared.db._ensure_tables` | `signals`, `signal_snapshots`, **`flow_ledger`** (+ indexes, **`UNIQUE(alert_id)`**), **`news_events`** alongside grader tables |
 
 Load the tracker section after parsing YAML: `load_tracker_config(load_config(...))`.
 
@@ -999,11 +1003,24 @@ UW API: flow alerts (every 30s)
                     │                          │
                     │  chain_poller.poll()      │
                     │  flow_watcher.check() ◄───┼── also reads ledger
+                    │  news_watcher.check()     │◄── UW headlines + EDGAR (4h each)
                     │  ledger.aggregate()       │◄── aggregate stats
-                    │  conviction.evaluate()    │◄── uses aggregate
+                    │  conviction.evaluate()    │◄── aggregate + news
                     │  snapshot + update        │
                     └──────────────────────────┘
 ```
+
+### News watcher
+
+The **news watcher** follows the **News Watcher** design (`news_watcher_design.md`): it keeps **UW headlines** and **SEC EDGAR full-text (EFTS)** results on a **per-signal schedule** so monitored tickers are not only judged at grading time.
+
+**Cadence (implementation note):** the reference design called for UW headlines every **15 minutes** and EDGAR every **4 hours**. This repo uses **4 hours (14 400 seconds) for both** so headline polling stays aligned with EDGAR’s slower, filing-oriented rhythm and further reduces UW API volume on watched names. Override with **`tracker.news.headline_interval_seconds`** / **`tracker.news.edgar_interval_seconds`** in `config/rules.yaml` if you want a faster headline loop.
+
+**Behavior:** each monitor cycle calls **`NewsWatcher.check()`**, which may **skip** a source until its interval has elapsed (in-memory last-poll map; after a process restart both sources run on the next cycle to catch up). New rows are written to **`news_events`** after **`source_id`** dedup against the table. **`regrade_recommended`** is logged as **`monitor.regrade_trigger_news`** when tier‑1 catalyst text, two or more tier‑2-only catalyst headlines in the same batch, or a material filing type (**`SC 13D`**, **`SC 13D/A`**, **`8-K`**, **`DEFA14A`**) appears—**LLM re-grade is not invoked yet**; a future re-grader can read **`news_events`** plus ledger and snapshots.
+
+**SEC access:** EDGAR requests use **`https://efts.sec.gov/LATEST/search-index`** with a configurable **`edgar_user_agent`** (SEC expects contact information). Failures are logged and return an empty filing list so the monitor still runs on headlines.
+
+**Conviction:** when **`news.events`** is non-empty in a cycle, the engine adds **+4** if **`has_catalyst`** and **+5** if any SEC filing is present (same design as the conviction doc).
 
 ### Integration note
 
@@ -1073,12 +1090,12 @@ python -m pytest tests/test_risk_analyst.py -v --tb=short
 python -m pytest tests/test_gate0.py -v --tb=short
 
 # Signal tracker (models + SignalStore + chain poller + flow watcher + flow ledger)
-python -m pytest tests/test_tracker_models.py tests/test_signal_store.py tests/test_chain_poller.py tests/test_flow_watcher.py tests/test_flow_ledger.py tests/test_conviction.py -v
+python -m pytest tests/test_tracker_models.py tests/test_signal_store.py tests/test_chain_poller.py tests/test_flow_watcher.py tests/test_flow_ledger.py tests/test_conviction.py tests/test_news_watcher.py -v
 ```
 
 Install the project editable plus test (or dev) extras so `respx` and `pytest-asyncio` are present: `pip install -e ".[test,grader]"` (minimal for CI) or `pip install -e ".[dev,grader]"` (includes ruff/mypy). Pytest is configured with `pythonpath = ["src", "."]` in `pyproject.toml` so `grader`, `scanner`, `shared`, and `tracker` import from `src/` without setting `PYTHONPATH` manually.
 
-Notable suites: `tests/test_gate0.py`, `tests/test_gate1_5.py`, `tests/test_sector_cache.py`, `tests/test_vol_analyst.py`, `tests/test_risk_analyst.py`, `tests/test_sector_analyst.py`, `tests/test_sentiment_analyst.py`, `tests/test_insider_tracker.py`, `tests/test_flow_analyst.py`, `tests/test_tracker_models.py`, `tests/test_signal_store.py`, `tests/test_chain_poller.py`, `tests/test_flow_watcher.py`, `tests/test_flow_ledger.py`, `tests/test_conviction.py`.
+Notable suites: `tests/test_gate0.py`, `tests/test_gate1_5.py`, `tests/test_sector_cache.py`, `tests/test_vol_analyst.py`, `tests/test_risk_analyst.py`, `tests/test_sector_analyst.py`, `tests/test_sentiment_analyst.py`, `tests/test_insider_tracker.py`, `tests/test_flow_analyst.py`, `tests/test_tracker_models.py`, `tests/test_signal_store.py`, `tests/test_chain_poller.py`, `tests/test_flow_watcher.py`, `tests/test_flow_ledger.py`, `tests/test_conviction.py`, `tests/test_news_watcher.py`.
 
 If your default `python` is not 3.11+, run tests with `python3.11 -m pytest ...` (project requires Python 3.11+).
 

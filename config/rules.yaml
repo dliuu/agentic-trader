@@ -135,6 +135,14 @@ tracker:
   neighbor_strike_radius: 5             # check ±N strikes from signal's strike
   neighbor_expiry_radius: 1             # check ±N expiries from signal's expiry
 
+  # News watcher — UW headlines + SEC EDGAR EFTS on per-signal cadence (see README)
+  news:
+    enabled: true
+    headline_interval_seconds: 14400    # 4 hours — aligned with EDGAR cadence below
+    edgar_interval_seconds: 14400       # 4 hours
+    edgar_lookback_days: 7
+    edgar_user_agent: "agentic-trader/1.0 your-email@example.com"
+
   # Flow ledger — watched-ticker scanner bypass + conviction / flow_watcher context
   ledger:
     enabled: true

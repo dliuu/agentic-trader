@@ -2,7 +2,84 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+
+
+@dataclass(frozen=True)
+class NewsWatcherConfig:
+    """News watcher polling and detection settings."""
+
+    enabled: bool = True
+
+    headline_interval_seconds: int = 14400  # 4 hours — same cadence as SEC EDGAR polls
+    edgar_interval_seconds: int = 14400
+    headline_limit: int = 20
+
+    edgar_lookback_days: int = 7
+    edgar_user_agent: str = "agentic-trader/1.0 contact@example.com"
+    edgar_filing_types: tuple[str, ...] = (
+        "SC 13D",
+        "SC 13D/A",
+        "8-K",
+        "DEFA14A",
+        "S-1",
+        "13F-HR",
+    )
+
+    tier1_catalyst_keywords: tuple[str, ...] = (
+        "acquisition",
+        "acquire",
+        "merger",
+        "buyout",
+        "takeover",
+        "going private",
+        "tender offer",
+        "13d",
+        "activist",
+        "proxy fight",
+        "hostile",
+        "fda approval",
+        "fda approv",
+        "pdufa",
+        "breakthrough designation",
+        "accelerated approval",
+        "complete response letter",
+        "crl",
+        "restructuring",
+        "strategic alternatives",
+        "exploring options",
+        "special committee",
+    )
+
+    tier2_catalyst_keywords: tuple[str, ...] = (
+        "upgrade",
+        "downgrade",
+        "price target",
+        "initiates coverage",
+        "analyst",
+        "partnership",
+        "collaboration",
+        "license agreement",
+        "phase 3",
+        "phase 2",
+        "clinical trial",
+        "data readout",
+        "offering",
+        "secondary",
+        "shelf registration",
+        "management change",
+        "ceo",
+        "board of directors",
+    )
+
+    regrade_filing_types: tuple[str, ...] = (
+        "SC 13D",
+        "SC 13D/A",
+        "8-K",
+        "DEFA14A",
+    )
+
+    min_tier2_for_regrade: int = 2
 
 
 @dataclass(frozen=True)
@@ -77,6 +154,8 @@ class TrackerConfig:
     # Flow ledger (scanner bypass + monitor / flow_watcher)
     ledger: LedgerConfig = LedgerConfig()
 
+    news: NewsWatcherConfig = field(default_factory=NewsWatcherConfig)
+
 
 def load_tracker_config(raw_config: dict) -> TrackerConfig:
     """Build TrackerConfig from the parsed rules.yaml dict.
@@ -109,6 +188,18 @@ def load_tracker_config(raw_config: dict) -> TrackerConfig:
         dte_pressure_below_14=int(scoring_raw.get("dte_pressure_below_14", -3)),
     )
 
+    news_raw = section.get("news") or {}
+    news = NewsWatcherConfig(
+        enabled=bool(news_raw.get("enabled", True)),
+        headline_interval_seconds=int(news_raw.get("headline_interval_seconds", 14400)),
+        edgar_interval_seconds=int(news_raw.get("edgar_interval_seconds", 14400)),
+        headline_limit=int(news_raw.get("headline_limit", 20)),
+        edgar_lookback_days=int(news_raw.get("edgar_lookback_days", 7)),
+        edgar_user_agent=str(
+            news_raw.get("edgar_user_agent", NewsWatcherConfig.edgar_user_agent)
+        ),
+    )
+
     return TrackerConfig(
         enabled=bool(section.get("enabled", True)),
         poll_interval_market_seconds=int(section.get("poll_interval_market_seconds", 300)),
@@ -128,4 +219,5 @@ def load_tracker_config(raw_config: dict) -> TrackerConfig:
         neighbor_expiry_radius=int(section.get("neighbor_expiry_radius", 1)),
         scoring=scoring,
         ledger=ledger,
+        news=news,
     )

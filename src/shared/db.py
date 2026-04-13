@@ -141,6 +141,27 @@ async def _ensure_tables(db: aiosqlite.Connection) -> None:
         CREATE INDEX IF NOT EXISTS idx_ledger_ticker ON flow_ledger(ticker);
         CREATE INDEX IF NOT EXISTS idx_ledger_created ON flow_ledger(created_at);
         CREATE UNIQUE INDEX IF NOT EXISTS idx_ledger_alert_unique ON flow_ledger(alert_id);
+
+        CREATE TABLE IF NOT EXISTS news_events (
+            id TEXT PRIMARY KEY,
+            signal_id TEXT NOT NULL,
+            ticker TEXT NOT NULL,
+            event_type TEXT NOT NULL,
+            title TEXT NOT NULL,
+            source TEXT NOT NULL,
+            url TEXT,
+            published_at TEXT NOT NULL,
+            detected_at TEXT NOT NULL,
+            catalyst_matched INTEGER NOT NULL DEFAULT 0,
+            catalyst_keywords TEXT,
+            filing_type TEXT,
+            source_id TEXT NOT NULL DEFAULT '',
+            FOREIGN KEY (signal_id) REFERENCES signals(id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_news_signal ON news_events(signal_id);
+        CREATE INDEX IF NOT EXISTS idx_news_ticker ON news_events(ticker);
+        CREATE INDEX IF NOT EXISTS idx_news_source_id ON news_events(source_id);
+        CREATE INDEX IF NOT EXISTS idx_news_detected ON news_events(detected_at);
         """
     )
     await db.commit()

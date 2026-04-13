@@ -71,3 +71,24 @@ class TestLoadTrackerConfig:
         cfg = load_tracker_config({"grader": {"enabled": True}})
         assert cfg.enabled is True
         assert isinstance(cfg, TrackerConfig)
+
+    def test_news_section_defaults(self):
+        cfg = load_tracker_config({})
+        assert cfg.news.headline_interval_seconds == 14400
+        assert cfg.news.edgar_interval_seconds == 14400
+
+    def test_news_section_overrides(self):
+        cfg = load_tracker_config(
+            {
+                "tracker": {
+                    "news": {
+                        "enabled": False,
+                        "headline_interval_seconds": 7200,
+                        "edgar_user_agent": "custom/1.0 test@example.com",
+                    }
+                }
+            }
+        )
+        assert cfg.news.enabled is False
+        assert cfg.news.headline_interval_seconds == 7200
+        assert cfg.news.edgar_user_agent == "custom/1.0 test@example.com"

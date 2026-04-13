@@ -5,6 +5,7 @@ For each active signal, every poll cycle:
   1. Check terminal conditions (expiry, DTE)
   2. Poll the option chain (chain_poller)
   3. Watch for new flow (flow_watcher)
+  3.5 Poll headlines + SEC EDGAR on cadence (news_watcher), persist catalyst rows
   4. Evaluate conviction (conviction engine)
   5. Persist snapshot + update signal state
   6. Push actionable signals to the executor queue
@@ -26,6 +27,7 @@ from tracker.conviction import ConvictionEngine
 from tracker.flow_ledger import FlowLedger, ledger_entry_from_flow_event
 from tracker.flow_watcher import FlowWatcher
 from tracker.models import Signal, SignalSnapshot, SignalState
+from tracker.news_watcher import NewsWatcher
 from tracker.signal_store import SignalStore
 
 log = structlog.get_logger()
@@ -67,6 +69,7 @@ async def run_monitor(
         scanner_db_path=scanner_db_path,
         flow_ledger=flow_ledger,
     )
+    news_watcher = NewsWatcher(client, api_token, config=cfg.news)
     engine = ConvictionEngine(config=cfg)
 
     # Build market clock for hours detection
@@ -110,7 +113,15 @@ async def run_monitor(
         for signal in active_signals:
             try:
                 await _process_signal(
-                    signal, store, poller, watcher, engine, executor_queue, cfg, flow_ledger
+                    signal,
+                    store,
+                    poller,
+                    watcher,
+                    news_watcher,
+                    engine,
+                    executor_queue,
+                    cfg,
+                    flow_ledger,
                 )
             except Exception as exc:
                 log.error(
@@ -148,6 +159,7 @@ async def _process_signal(
     store: SignalStore,
     poller: ChainPoller,
     watcher: FlowWatcher,
+    news_watcher: NewsWatcher,
     engine: ConvictionEngine,
     executor_queue: asyncio.Queue[Signal],
     cfg: TrackerConfig,
@@ -180,9 +192,29 @@ async def _process_signal(
             )
         ledger_agg = await flow_ledger.aggregate(signal.id)
 
+    news = await news_watcher.check(signal)
+    if news.events:
+        await news_watcher.persist_events(news.events)
+        log.info(
+            "monitor.news_events",
+            signal_id=signal.id,
+            ticker=signal.ticker,
+            count=len(news.events),
+            catalyst=news.has_catalyst,
+            filing=news.filing_detected,
+        )
+
+    if news.regrade_recommended:
+        log.info(
+            "monitor.regrade_trigger_news",
+            signal_id=signal.id,
+            ticker=signal.ticker,
+            catalysts=news.catalyst_types,
+        )
+
     # 4. Evaluate conviction
     result = engine.evaluate(
-        signal, chain, flow, prev_snapshot, ledger_aggregate=ledger_agg
+        signal, chain, flow, prev_snapshot, ledger_aggregate=ledger_agg, news=news
     )
 
     # 5. Compute new values
