@@ -1,60 +1,52 @@
-"""Replay saved API responses through the rule engine.
+"""CLI for full-pipeline replay. Core logic: ``replay.runner.run_replay_pipeline``."""
 
-Usage:
-    python scripts/replay.py tests/fixtures/flow_alerts_sample.json
+from __future__ import annotations
 
-Prints which alerts would have been flagged and their scores.
-Useful for tuning config/rules.yaml without burning API calls.
-"""
 import argparse
-import json
+import asyncio
 import sys
 from pathlib import Path
 
-# Add project root to path
+from dotenv import load_dotenv
+
+load_dotenv()
+
 project_root = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(project_root / "src"))
 
-from scanner.models.flow_alert import FlowAlert
-from scanner.rules.engine import RuleEngine
-import yaml
 
-
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("fixture", type=str, help="Path to flow_alerts JSON file")
-    parser.add_argument("--config", type=str, default=None, help="Path to rules.yaml")
+async def main() -> int:
+    parser = argparse.ArgumentParser(description="Full pipeline replay with simulated clock.")
+    parser.add_argument("--data-dir", required=True, type=str)
+    parser.add_argument("--output", required=True, type=str)
+    parser.add_argument("--config", default=str(project_root / "config" / "rules.yaml"))
+    parser.add_argument(
+        "--mock-llm",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Skip Gate 3 LLM (default: on).",
+    )
     args = parser.parse_args()
-
-    fixture_path = Path(args.fixture)
-    if not fixture_path.exists():
-        print(f"File not found: {fixture_path}")
+    if not args.mock_llm:
+        print("Live Gate 3 in replay is not wired; use --mock-llm (default).")
         return 1
 
-    config_path = Path(args.config) if args.config else project_root / "config" / "rules.yaml"
-    config = yaml.safe_load(config_path.read_text())
+    from shared.config import load_config
+    from replay.runner import run_replay_pipeline
 
-    raw = json.loads(fixture_path.read_text())
-    data = raw.get("data", raw) if isinstance(raw, dict) else raw
-    if not isinstance(data, list):
-        data = [data]
-
-    alerts = []
-    for item in data:
-        try:
-            alerts.append(FlowAlert.model_validate(item))
-        except Exception as e:
-            print(f"Skipped: {e}")
-
-    engine = RuleEngine(config)
-    candidates = engine.evaluate_batch(alerts)
-
-    print(f"Alerts: {len(alerts)}, Candidates: {len(candidates)}")
-    for c in candidates:
-        print(f"  {c.ticker} {c.direction} — score {c.confluence_score:.1f} — {[s.rule_name for s in c.signals]}")
-
+    config = load_config(Path(args.config))
+    result = await run_replay_pipeline(
+        data_dir=Path(args.data_dir),
+        output_dir=Path(args.output),
+        config=config,
+        mock_llm=args.mock_llm,
+    )
+    if not result.get("ok", True):
+        print(result.get("error", "replay failed"))
+        return 1
+    print(f"Replay complete -> {result.get('output_dir')} ({result.get('signals_created', 0)} signals)")
     return 0
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    raise SystemExit(asyncio.run(main()))

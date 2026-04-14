@@ -4,9 +4,12 @@ from __future__ import annotations
 
 import uuid
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any
 
-from shared.db import get_db
+import aiosqlite
+
+from shared.db import _ensure_tables, get_db
 from tracker.models import LedgerAggregate, LedgerEntry
 
 
@@ -25,6 +28,19 @@ def _dt(v: str | None) -> datetime | None:
 class FlowLedger:
     """Append-only flow record for watched tickers."""
 
+    def __init__(self, db_path: str | None = None):
+        self._db_path = db_path
+
+    async def _connect(self) -> aiosqlite.Connection:
+        if self._db_path:
+            p = Path(self._db_path)
+            p.parent.mkdir(parents=True, exist_ok=True)
+            db = await aiosqlite.connect(str(p))
+            await db.execute("PRAGMA journal_mode=WAL")
+            await _ensure_tables(db)
+            return db
+        return await get_db()
+
     async def record(self, entry: LedgerEntry) -> None:
         """Write a single flow event. Idempotent on alert_id (INSERT OR IGNORE)."""
         await self.record_batch([entry])
@@ -33,7 +49,7 @@ class FlowLedger:
         """Write multiple events in one transaction."""
         if not entries:
             return
-        db = await get_db()
+        db = await self._connect()
         try:
             await db.executemany(
                 """INSERT OR IGNORE INTO flow_ledger
@@ -75,7 +91,7 @@ class FlowLedger:
         self, signal_id: str, since: datetime | None = None
     ) -> list[LedgerEntry]:
         """All ledger entries for a signal, optionally filtered by created_at > since."""
-        db = await get_db()
+        db = await self._connect()
         try:
             if since is not None:
                 cursor = await db.execute(
@@ -100,7 +116,7 @@ class FlowLedger:
 
     async def aggregate(self, signal_id: str) -> LedgerAggregate:
         """Compute summary stats for conviction engine and re-grader."""
-        db = await get_db()
+        db = await self._connect()
         try:
             cursor = await db.execute(
                 """
@@ -150,7 +166,7 @@ class FlowLedger:
 
     async def has_alert(self, alert_id: str) -> bool:
         """Check if an alert_id is already recorded (dedup)."""
-        db = await get_db()
+        db = await self._connect()
         try:
             cur = await db.execute(
                 "SELECT 1 FROM flow_ledger WHERE alert_id = ? LIMIT 1", (alert_id,)
@@ -162,7 +178,7 @@ class FlowLedger:
 
     async def purge_terminal(self, signal_id: str) -> int:
         """Delete entries for a terminal signal. Returns rows deleted."""
-        db = await get_db()
+        db = await self._connect()
         try:
             cur = await db.execute("DELETE FROM flow_ledger WHERE signal_id = ?", (signal_id,))
             await db.commit()
@@ -178,7 +194,7 @@ class FlowLedger:
             hour=0, minute=0, second=0, microsecond=0
         )
         boundary = (cutoff - timedelta(days=retention_days)).isoformat()
-        db = await get_db()
+        db = await self._connect()
         try:
             cur = await db.execute(
                 "DELETE FROM flow_ledger WHERE created_at < ?", (boundary,)

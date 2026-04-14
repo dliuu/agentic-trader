@@ -1,0 +1,21 @@
+# Example parameter sweeps for scripts/param_sweep.py
+sweeps:
+  - name: "relax_final_score"
+    parameter: "grader.score_threshold"
+    values: [65, 70, 75, 78, 82]
+
+  - name: "vary_premium"
+    parameter: "filters.premium.min_premium_usd"
+    values: [15000, 25000, 50000, 75000]
+
+  - name: "vary_actionable_conviction"
+    parameter: "tracker.actionable_conviction"
+    values: [80, 85, 90, 95]
+
+  - name: "vary_monitoring_window"
+    parameter: "tracker.monitoring_window_days"
+    values: [5, 7, 10, 14]
+
+  - name: "vary_confirming_flows"
+    parameter: "tracker.actionable_min_confirming_flows"
+    values: [1, 2, 3]

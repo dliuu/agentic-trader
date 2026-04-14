@@ -463,3 +463,48 @@ def _parse_candidate_expiry(expiry_value: str) -> datetime:
     except Exception:
         return datetime.now(timezone.utc)
 
+
+def build_vol_context_from_saved_json(
+    candidate: Candidate,
+    *,
+    chain_response: dict[str, Any],
+    vol_stats_response: dict[str, Any] | None,
+    iv_rank_response: dict[str, Any] | None = None,
+    term_structure_response: dict[str, Any] | None = None,
+) -> VolContext | None:
+    """Assemble ``VolContext`` from backfilled JSON (replay without live vol endpoints).
+
+    When IV rank or term-structure payloads are missing, uses neutral placeholders
+    so volatility scoring can still run from chain + vol stats alone.
+    """
+    neutral_iv: dict[str, Any] = {
+        "data": {
+            "iv_rank": 50.0,
+            "iv_percentile": 50.0,
+            "iv": 0.35,
+            "implied_volatility": 0.35,
+        }
+    }
+    neutral_term: dict[str, Any] = {"data": []}
+    neutral_vol: dict[str, Any] = {
+        "data": {
+            "realized_volatility_20d": 0.25,
+            "realized_volatility_60d": 0.25,
+            "implied_volatility": 0.35,
+        }
+    }
+    iv_r = iv_rank_response if iv_rank_response is not None else neutral_iv
+    term_r = term_structure_response if term_structure_response is not None else neutral_term
+    vs = vol_stats_response if vol_stats_response is not None else neutral_vol
+    try:
+        return _assemble_vol_context(
+            candidate=candidate,
+            iv_data=iv_r,
+            vol_data=vs,
+            term_data=term_r,
+            chain_data=chain_response,
+        )
+    except Exception as e:
+        logger.error("vol_ctx.saved_snapshot_failed", ticker=candidate.ticker, error=str(e))
+        return None
+

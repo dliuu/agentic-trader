@@ -32,6 +32,7 @@ from tracker.models import RegradeResult, Signal, SignalSnapshot, SignalState, T
 from tracker.news_watcher import NewsWatcher
 from tracker.regrader import Regrader
 from tracker.signal_store import SignalStore
+from grader.llm_client import LLMClient
 
 log = structlog.get_logger()
 
@@ -41,13 +42,13 @@ async def run_monitor(
     api_token: str,
     executor_queue: asyncio.Queue[Signal],
     config: TrackerConfig | None = None,
+    enrichment_config: EnrichmentConfig | None = None,
     polling_config: dict | None = None,
     scanner_db_path: str | None = None,
+    llm_client: LLMClient | None = None,
+    finnhub_api_key: str = "",
     *,
     max_cycles: int | None = None,
-    enrichment_cfg: EnrichmentConfig | None = None,
-    anthropic_api_key: str = "",
-    finnhub_api_key: str = "",
 ) -> None:
     """Main monitor loop.
 
@@ -59,8 +60,8 @@ async def run_monitor(
         polling_config: The 'polling' section from rules.yaml (for MarketClock).
         scanner_db_path: Path to the scanner's SQLite DB for flow watcher.
         max_cycles: If set, run at most N cycles then exit (for testing).
-        enrichment_cfg: Optional `enrichment` block (re-grader settings).
-        anthropic_api_key: Claude API key for re-grader (optional).
+        enrichment_config: Optional enrichment config (enables ledger/news/regrader).
+        llm_client: Pre-constructed Claude client for re-grader (optional).
         finnhub_api_key: Finnhub key for sentiment/insider context in re-grade.
     """
     cfg = config or TrackerConfig()
@@ -71,40 +72,35 @@ async def run_monitor(
 
     store = SignalStore()
     poller = ChainPoller(client, api_token, config=cfg)
-    flow_ledger = FlowLedger() if cfg.ledger.enabled else None
-    watcher = FlowWatcher(
-        client,
-        api_token,
-        scanner_db_path=scanner_db_path,
-        flow_ledger=flow_ledger,
-    )
-    news_watcher = NewsWatcher(client, api_token, config=cfg.news)
-    engine = ConvictionEngine(config=cfg)
+    ecfg = enrichment_config
 
+    ledger: FlowLedger | None = None
+    news_watcher: NewsWatcher | None = None
     regrader: Regrader | None = None
-    enc = enrichment_cfg or EnrichmentConfig()
-    if enc.regrader.enabled and anthropic_api_key.strip():
-        try:
-            from grader.llm_client import LLMClient
 
-            llm = LLMClient(
-                api_key=anthropic_api_key.strip(),
-                model=enc.regrader.model,
-                max_tokens=enc.regrader.max_tokens,
-                timeout=enc.regrader.timeout_seconds,
-            )
+    if ecfg is not None:
+        if ecfg.ledger.enabled:
+            ledger = FlowLedger()
+        if ecfg.news.enabled:
+            news_watcher = NewsWatcher(client, api_token, config=ecfg.news)
+        if ecfg.regrader.enabled and llm_client is not None:
             regrader = Regrader(
-                llm,
+                llm_client,
                 client,
                 api_token,
                 finnhub_api_key or "",
                 store,
-                config=enc.regrader,
+                config=ecfg.regrader,
                 news_watcher=news_watcher,
             )
-            log.info("monitor.regrader_enabled")
-        except Exception as exc:
-            log.warning("monitor.regrader_init_failed", error=str(exc))
+
+    watcher = FlowWatcher(
+        client,
+        api_token,
+        scanner_db_path=scanner_db_path,
+        flow_ledger=ledger,
+    )
+    engine = ConvictionEngine(config=cfg)
 
     # Build market clock for hours detection
     clock = None
@@ -115,7 +111,15 @@ async def run_monitor(
             pass
 
     cycle_count = 0
-    log.info("monitor.started", max_active=cfg.max_active_signals)
+    log.info(
+        "monitor.started",
+        max_active=cfg.max_active_signals,
+        enrichment={
+            "ledger": ledger is not None,
+            "news_watcher": news_watcher is not None,
+            "regrader": regrader is not None,
+        },
+    )
 
     while max_cycles is None or cycle_count < max_cycles:
         cycle_count += 1
@@ -156,7 +160,7 @@ async def run_monitor(
                     engine,
                     executor_queue,
                     cfg,
-                    flow_ledger,
+                    ledger,
                 )
             except Exception as exc:
                 log.error(
@@ -169,13 +173,14 @@ async def run_monitor(
         log.info("monitor.cycle_complete", cycle=cycle_count)
 
         if (
-            flow_ledger is not None
-            and cfg.ledger.retention_days > 0
+            ledger is not None
+            and ecfg is not None
+            and ecfg.ledger.retention_days > 0
             and cycle_count > 0
             and cycle_count % 20 == 0
         ):
             try:
-                n = await flow_ledger.purge_entries_older_than(cfg.ledger.retention_days)
+                n = await ledger.purge_entries_older_than(ecfg.ledger.retention_days)
                 if n:
                     log.info("monitor.ledger_retention_purge", rows=n)
             except Exception as exc:
@@ -194,12 +199,12 @@ async def _process_signal(
     store: SignalStore,
     poller: ChainPoller,
     watcher: FlowWatcher,
-    news_watcher: NewsWatcher,
+    news_watcher: NewsWatcher | None,
     regrader: Regrader | None,
     engine: ConvictionEngine,
     executor_queue: asyncio.Queue[Signal],
     cfg: TrackerConfig,
-    flow_ledger: FlowLedger | None,
+    ledger: FlowLedger | None,
 ) -> None:
     """Run one poll cycle for a single signal."""
     now = datetime.now(timezone.utc)
@@ -213,40 +218,67 @@ async def _process_signal(
     # 3. Watch for new flow
     flow = await watcher.check(signal)
 
-    # 3.5–3.6: persist watcher events to ledger, then aggregate for conviction
+    # 3a–3b: persist watcher events to ledger, then aggregate for conviction
     ledger_agg = None
-    if flow_ledger is not None:
-        for event in flow.events:
-            await flow_ledger.record(
-                ledger_entry_from_flow_event(
-                    event,
+    if ledger is not None:
+        if flow.events:
+            try:
+                for event in flow.events:
+                    await ledger.record(
+                        ledger_entry_from_flow_event(
+                            event,
+                            signal_id=signal.id,
+                            signal=signal,
+                            source="flow_watcher",
+                            recorded_at=now,
+                        )
+                    )
+            except Exception as exc:
+                log.warning(
+                    "monitor.ledger_write_failed",
                     signal_id=signal.id,
-                    signal=signal,
-                    source="flow_watcher",
-                    recorded_at=now,
+                    ticker=signal.ticker,
+                    error=str(exc),
                 )
+        try:
+            ledger_agg = await ledger.aggregate(signal.id)
+        except Exception as exc:
+            log.warning(
+                "monitor.ledger_aggregate_failed",
+                signal_id=signal.id,
+                ticker=signal.ticker,
+                error=str(exc),
             )
-        ledger_agg = await flow_ledger.aggregate(signal.id)
 
-    news = await news_watcher.check(signal)
-    if news.events:
-        await news_watcher.persist_events(news.events)
-        log.info(
-            "monitor.news_events",
-            signal_id=signal.id,
-            ticker=signal.ticker,
-            count=len(news.events),
-            catalyst=news.has_catalyst,
-            filing=news.filing_detected,
-        )
-
-    if news.regrade_recommended:
-        log.info(
-            "monitor.regrade_trigger_news",
-            signal_id=signal.id,
-            ticker=signal.ticker,
-            catalysts=news.catalyst_types,
-        )
+    # 3c: check news (cadence-gated internally)
+    news = None
+    if news_watcher is not None:
+        try:
+            news = await news_watcher.check(signal)
+            if news.events:
+                await news_watcher.persist_events(news.events)
+                log.info(
+                    "monitor.news_events",
+                    signal_id=signal.id,
+                    ticker=signal.ticker,
+                    count=len(news.events),
+                    catalyst=news.has_catalyst,
+                    filing=news.filing_detected,
+                )
+            if news.regrade_recommended:
+                log.info(
+                    "monitor.regrade_trigger_news",
+                    signal_id=signal.id,
+                    ticker=signal.ticker,
+                    catalysts=news.catalyst_types,
+                )
+        except Exception as exc:
+            log.warning(
+                "monitor.news_check_failed",
+                signal_id=signal.id,
+                ticker=signal.ticker,
+                error=str(exc),
+            )
 
     # 4. Evaluate conviction
     result = engine.evaluate(
@@ -302,6 +334,8 @@ async def _process_signal(
             blended=round(new_conviction, 1),
             trigger=regrade.trigger_reason,
         )
+        # Re-evaluate state transition with blended score (pure).
+        new_state = engine.next_state(signal, new_conviction, flow, chain, now)
 
     # 6. Build and persist snapshot
     # Compute spread percentage
@@ -398,13 +432,14 @@ async def _process_signal(
 
     await store.update_signal(signal.id, **update_fields)
 
-    if (
-        flow_ledger is not None
-        and cfg.ledger.purge_terminal_signals
-        and new_state in (SignalState.EXPIRED, SignalState.DECAYED, SignalState.EXECUTED)
+    if ledger is not None and new_state in (
+        SignalState.EXPIRED,
+        SignalState.DECAYED,
+        SignalState.EXECUTED,
     ):
+        # Ledger retention policy is controlled by enrichment config; monitor only purges on terminal.
         try:
-            deleted = await flow_ledger.purge_terminal(signal.id)
+            deleted = await ledger.purge_terminal(signal.id)
             if deleted:
                 log.info("monitor.ledger_purged_signal", signal_id=signal.id, rows=deleted)
         except Exception as exc:

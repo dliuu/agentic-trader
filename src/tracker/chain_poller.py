@@ -209,6 +209,126 @@ class ChainPoller:
             contract_found=True,
         )
 
+    def from_saved_json(
+        self,
+        raw: dict[str, Any] | list[Any],
+        signal: Signal,
+        *,
+        polled_at: datetime | None = None,
+    ) -> ChainPollResult:
+        """Parse a saved /option-chains API payload (replay / backtests). No HTTP."""
+        now = polled_at or datetime.now(timezone.utc)
+        chains = raw.get("data", raw) if isinstance(raw, dict) else raw
+        if not isinstance(chains, list):
+            chains = [chains] if isinstance(chains, dict) else []
+
+        contracts: dict[tuple[str, float, str], dict] = {}
+        for entry in chains:
+            if not isinstance(entry, dict):
+                continue
+            exp = str(entry.get("expiry") or entry.get("expiration_date") or "")
+            stk = self._parse_float(entry.get("strike") or entry.get("strike_price"))
+            opt = self._normalize_option_type(
+                str(entry.get("option_type") or entry.get("type") or "")
+            )
+            if exp and stk is not None and opt:
+                contracts[(exp, stk, opt)] = entry
+
+        key = (signal.expiry, signal.strike, signal.option_type)
+        contract = contracts.get(key)
+
+        if contract is None:
+            return ChainPollResult(
+                ticker=signal.ticker,
+                polled_at=now,
+                contract_found=False,
+            )
+
+        contract_oi = self._parse_int(contract.get("open_interest") or contract.get("oi"))
+        contract_vol = self._parse_int(contract.get("volume"))
+        contract_bid = self._parse_float(contract.get("bid"))
+        contract_ask = self._parse_float(contract.get("ask"))
+        contract_last = self._parse_float(contract.get("last_price") or contract.get("last"))
+        contract_iv = self._parse_float(contract.get("implied_volatility") or contract.get("iv"))
+        spot = self._parse_float(
+            contract.get("underlying_price") or contract.get("stock_price")
+        )
+
+        all_strikes_this_expiry = sorted({
+            stk for (exp, stk, _), _ in contracts.items()
+            if exp == signal.expiry
+        })
+
+        try:
+            center_idx = all_strikes_this_expiry.index(signal.strike)
+        except ValueError:
+            center_idx = -1
+
+        radius = self._cfg.neighbor_strike_radius
+        if center_idx >= 0:
+            start = max(0, center_idx - radius)
+            end = min(len(all_strikes_this_expiry), center_idx + radius + 1)
+            neighbor_strikes_list = all_strikes_this_expiry[start:end]
+        else:
+            neighbor_strikes_list = []
+
+        neighbors: list[NeighborStrike] = []
+        for stk in neighbor_strikes_list:
+            if stk == signal.strike:
+                continue
+            for opt_type in ("call", "put"):
+                nkey = (signal.expiry, stk, opt_type)
+                ndata = contracts.get(nkey)
+                if ndata is None:
+                    continue
+                n_oi = self._parse_int(ndata.get("open_interest") or ndata.get("oi")) or 0
+                n_vol = self._parse_int(ndata.get("volume")) or 0
+                neighbors.append(NeighborStrike(
+                    strike=stk,
+                    option_type=opt_type,
+                    oi=n_oi,
+                    volume=n_vol,
+                    is_ghost=False,
+                ))
+
+        all_expiries = sorted({exp for (exp, _, _) in contracts})
+        try:
+            exp_idx = all_expiries.index(signal.expiry)
+        except ValueError:
+            exp_idx = -1
+
+        adjacent: list[AdjacentExpiryOI] = []
+        exp_radius = self._cfg.neighbor_expiry_radius
+        if exp_idx >= 0:
+            for offset in range(-exp_radius, exp_radius + 1):
+                adj_idx = exp_idx + offset
+                if adj_idx < 0 or adj_idx >= len(all_expiries) or offset == 0:
+                    continue
+                adj_exp = all_expiries[adj_idx]
+                adj_key = (adj_exp, signal.strike, signal.option_type)
+                adj_data = contracts.get(adj_key)
+                if adj_data:
+                    adjacent.append(AdjacentExpiryOI(
+                        expiry=adj_exp,
+                        oi=self._parse_int(adj_data.get("open_interest") or adj_data.get("oi")) or 0,
+                        volume=self._parse_int(adj_data.get("volume")) or 0,
+                    ))
+
+        return ChainPollResult(
+            ticker=signal.ticker,
+            polled_at=now,
+            contract_oi=contract_oi,
+            contract_volume=contract_vol,
+            contract_bid=contract_bid,
+            contract_ask=contract_ask,
+            contract_last_price=contract_last,
+            contract_iv=contract_iv,
+            spot_price=spot,
+            neighbor_strikes=neighbors,
+            adjacent_expiry_oi=adjacent,
+            contract_found=True,
+        )
+
     @staticmethod
     def _parse_float(v: Any) -> float | None:
         if v is None:

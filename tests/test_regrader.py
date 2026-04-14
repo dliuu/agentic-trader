@@ -144,8 +144,7 @@ class TestBlend:
 class TestLoadEnrichmentConfig:
     def test_defaults(self):
         cfg = load_enrichment_config({})
-        assert cfg.regrader.max_regrades_per_signal == 5
-        assert cfg.regrader.min_interval_seconds == 7200
+        assert cfg is None
 
     def test_yaml_section(self):
         raw = {
@@ -157,6 +156,7 @@ class TestLoadEnrichmentConfig:
             }
         }
         cfg = load_enrichment_config(raw)
+        assert cfg is not None
         assert cfg.regrader.enabled is False
         assert cfg.regrader.max_regrades_per_signal == 3
 

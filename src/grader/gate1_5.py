@@ -21,7 +21,10 @@ from datetime import date, datetime
 import httpx
 import structlog
 
-from grader.context.explainability_ctx import ExplainabilityContext, build_explainability_context
+from grader.context.explainability_ctx import (
+    ExplainabilityContext,
+    build_explainability_context,
+)
 from shared.filters import (
     EXPLAINABILITY_CONFIG,
     ExplainabilityConfig,
@@ -186,18 +189,22 @@ async def run_gate1_5(
     sector: str | None = None,
     config: ExplainabilityConfig | None = None,
     gate_cfg: GateThresholds | None = None,
+    explainability_ctx_override: ExplainabilityContext | None = None,
 ) -> Gate15Result:
     cfg = config or EXPLAINABILITY_CONFIG
     thresholds = gate_cfg or GateThresholds()
 
-    ctx = await build_explainability_context(
-        candidate,
-        client,
-        api_token,
-        scanner_db_path=scanner_db_path,
-        sector=sector,
-        config=cfg,
-    )
+    if explainability_ctx_override is not None:
+        ctx = explainability_ctx_override
+    else:
+        ctx = await build_explainability_context(
+            candidate,
+            client,
+            api_token,
+            scanner_db_path=scanner_db_path,
+            sector=sector,
+            config=cfg,
+        )
 
     reasons: list[str] = []
     earnings_pen = _check_earnings_play(candidate, ctx, cfg)

@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import json
 from datetime import datetime
+from pathlib import Path
 
+import aiosqlite
 import structlog
 
-from shared.db import get_db
+from shared.db import _ensure_tables, get_db
 from tracker.models import (
     ACTIVE_STATES,
     MONITORING_STATES,
@@ -36,9 +38,23 @@ def _parse_milestones_fired(raw: object) -> list[str]:
 class SignalStore:
     """CRUD operations for the signals and signal_snapshots tables."""
 
+    def __init__(self, db_path: str | None = None):
+        """If ``db_path`` is set, all operations use that SQLite file (e.g. replay)."""
+        self._db_path = db_path
+
+    async def _connect(self) -> aiosqlite.Connection:
+        if self._db_path:
+            p = Path(self._db_path)
+            p.parent.mkdir(parents=True, exist_ok=True)
+            db = await aiosqlite.connect(str(p))
+            await db.execute("PRAGMA journal_mode=WAL")
+            await _ensure_tables(db)
+            return db
+        return await get_db()
+
     async def create_signal(self, signal: Signal) -> None:
         """Insert a new signal. Called by signal_intake when a ScoredTrade arrives."""
-        db = await get_db()
+        db = await self._connect()
         try:
             await db.execute(
                 """INSERT INTO signals
@@ -92,7 +108,7 @@ class SignalStore:
 
     async def get_active_signals(self) -> list[Signal]:
         """Return all signals in pending or accumulating state."""
-        db = await get_db()
+        db = await self._connect()
         try:
             placeholders = ",".join(f"'{s.value}'" for s in ACTIVE_STATES)
             cursor = await db.execute(
@@ -107,7 +123,7 @@ class SignalStore:
 
     async def get_signal(self, signal_id: str) -> Signal | None:
         """Fetch a single signal by ID."""
-        db = await get_db()
+        db = await self._connect()
         try:
             cursor = await db.execute(
                 "SELECT * FROM signals WHERE id = ?", (signal_id,)
@@ -122,7 +138,7 @@ class SignalStore:
 
     async def count_active(self) -> int:
         """Count signals in active states."""
-        db = await get_db()
+        db = await self._connect()
         try:
             placeholders = ",".join(f"'{s.value}'" for s in ACTIVE_STATES)
             cursor = await db.execute(
@@ -161,7 +177,7 @@ class SignalStore:
                 values.append(val)
         values.append(signal_id)
 
-        db = await get_db()
+        db = await self._connect()
         try:
             await db.execute(
                 f"UPDATE signals SET {', '.join(set_clauses)} WHERE id = ?",
@@ -173,7 +189,7 @@ class SignalStore:
 
     async def add_snapshot(self, snapshot: SignalSnapshot) -> None:
         """Insert a signal snapshot."""
-        db = await get_db()
+        db = await self._connect()
         try:
             await db.execute(
                 """INSERT INTO signal_snapshots
@@ -215,7 +231,7 @@ class SignalStore:
         self, signal_id: str, limit: int = 100
     ) -> list[SignalSnapshot]:
         """Fetch snapshots for a signal, most recent first."""
-        db = await get_db()
+        db = await self._connect()
         try:
             cursor = await db.execute(
                 "SELECT * FROM signal_snapshots WHERE signal_id = ? "
@@ -235,7 +251,7 @@ class SignalStore:
 
     async def get_regrade_history(self, signal_id: str, limit: int = 50) -> list[dict]:
         """Rows from `regrades` for audit / debugging."""
-        db = await get_db()
+        db = await self._connect()
         try:
             cursor = await db.execute(
                 "SELECT * FROM regrades WHERE signal_id = ? ORDER BY regraded_at DESC LIMIT ?",
@@ -249,7 +265,7 @@ class SignalStore:
 
     async def check_duplicate_signal(self, ticker: str, strike: float, expiry: str) -> bool:
         """Check if an active signal already exists for this contract."""
-        db = await get_db()
+        db = await self._connect()
         try:
             placeholders = ",".join(f"'{s.value}'" for s in ACTIVE_STATES)
             cursor = await db.execute(
@@ -270,7 +286,7 @@ class SignalStore:
 
     async def get_watched_tickers(self) -> set[str]:
         """Tickers with a non-terminal monitored signal (pending, accumulating, or actionable)."""
-        db = await get_db()
+        db = await self._connect()
         try:
             ph, states = self._monitoring_state_placeholders()
             cursor = await db.execute(
@@ -284,7 +300,7 @@ class SignalStore:
 
     async def get_ticker_signal_map(self) -> dict[str, str]:
         """{ticker_upper: signal_id} for monitored signals; most recent signal wins per ticker."""
-        db = await get_db()
+        db = await self._connect()
         try:
             ph, states = self._monitoring_state_placeholders()
             cursor = await db.execute(
@@ -303,7 +319,7 @@ class SignalStore:
 
     async def has_active_signal_for_ticker(self, ticker: str) -> bool:
         """True if any monitored signal already exists for this ticker (one signal per ticker pilot)."""
-        db = await get_db()
+        db = await self._connect()
         try:
             ph, states = self._monitoring_state_placeholders()
             cursor = await db.execute(

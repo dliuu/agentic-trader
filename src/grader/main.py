@@ -23,7 +23,7 @@ from grader.llm_client import LLMClient
 from grader.models import ScoredTrade
 from grader.synthesis import SynthesisAgent
 from grader.context.sector_cache import get_sector_cache
-from shared.config import load_config
+from shared.config import gate_thresholds_from_config, load_config
 from shared.filters import InsiderScoringConfig
 from shared.models import Candidate
 from shared.uw_validation import bootstrap_uw_runtime_from_config, require_uw_api_token
@@ -55,6 +55,8 @@ async def run_grader(
         await bootstrap_uw_runtime_from_config(config)
     elif grader_cfg.get("enabled", True):
         require_uw_api_token()
+
+    gate_thr = gate_thresholds_from_config(config)
 
     async with httpx.AsyncClient() as http_client:
         llm: LLMClient | None = None
@@ -107,7 +109,7 @@ async def run_grader(
                 candidate_queue.task_done()
                 continue
 
-            passed_gate1, flow_score = await run_gate1(candidate)
+            passed_gate1, flow_score = await run_gate1(candidate, gate_cfg=gate_thr)
             if not passed_gate1:
                 candidate_queue.task_done()
                 continue
@@ -119,6 +121,7 @@ async def run_grader(
                 api_token=config["uw_api_token"],
                 scanner_db_path=scanner_db_path,
                 sector=gate0_result.sector,
+                gate_cfg=gate_thr,
             )
             if not gate1_5_result.passed:
                 log.info(
@@ -162,6 +165,7 @@ async def run_grader(
                 client=http_client,
                 api_token=config["uw_api_token"],
                 sector_cache=sector_cache,
+                gate_cfg=gate_thr,
             )
             if not passed_gate2:
                 candidate_queue.task_done()
@@ -188,6 +192,7 @@ async def run_grader(
                 synthesis_agent=synthesis_agent,
                 aggregator=aggregator,
                 final_threshold=grader_cfg["score_threshold"],
+                gate_cfg=gate_thr,
             )
             if scored_trade is not None:
                 await scored_queue.put(scored_trade)

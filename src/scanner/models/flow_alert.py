@@ -1,12 +1,19 @@
 from __future__ import annotations
 
+import os
 from datetime import date, datetime
 
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 def _today_for_dte() -> date:
-    """Wall-clock today for DTE; tests may monkeypatch this for determinism."""
+    """Wall-clock today for DTE; set FLOW_ALERT_DTE_ANCHOR_DATE=YYYY-MM-DD for backtests."""
+    raw = (os.environ.get("FLOW_ALERT_DTE_ANCHOR_DATE") or "").strip()
+    if raw:
+        try:
+            return date.fromisoformat(raw[:10])
+        except ValueError:
+            pass
     return date.today()
 
 

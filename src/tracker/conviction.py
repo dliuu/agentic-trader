@@ -65,6 +65,8 @@ class ConvictionEngine:
         prev_snapshot: SignalSnapshot | None,
         ledger_aggregate: LedgerAggregate | None = None,
         news: NewsWatchResult | None = None,
+        *,
+        as_of: datetime | None = None,
     ) -> ConvictionResult:
         """Evaluate one poll cycle of evidence.
 
@@ -82,7 +84,7 @@ class ConvictionEngine:
         result = ConvictionResult()
         result.oi_high_water = signal.oi_high_water
         result.days_without_flow = signal.days_without_flow
-        now = datetime.now(timezone.utc)
+        now = as_of if as_of is not None else datetime.now(timezone.utc)
 
         # --- Check terminal conditions first ---
         terminal = self._check_terminal(signal, chain, now)
@@ -119,6 +121,20 @@ class ConvictionEngine:
         result.next_state = self._next_state(signal, new_conviction, flow, chain, now)
 
         return result
+
+    def next_state(
+        self,
+        signal: Signal,
+        new_conviction: float,
+        flow: FlowWatchResult,
+        chain: ChainPollResult,
+        now: datetime,
+    ) -> SignalState:
+        """Public wrapper for the pure state transition function.
+
+        Needed by the monitor loop to re-evaluate transitions after blending.
+        """
+        return self._next_state(signal, new_conviction, flow, chain, now)
 
     # ─── Terminal condition checks ───
 

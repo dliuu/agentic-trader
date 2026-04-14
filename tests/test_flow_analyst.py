@@ -103,7 +103,7 @@ class TestFlowAnalyst:
         assert "premium_over_500k" in result.signals
         assert "sweep_fill" in result.signals
         assert "deep_otm_25pct" in result.signals
-        assert "weekly_expiry" in result.signals
+        assert "weekly_dte_penalty" in result.signals
 
     def test_weak_trade_scores_low(self):
         """A trade with minimal signals should score around 45-55."""
@@ -113,7 +113,7 @@ class TestFlowAnalyst:
             oi_change=1.0,
             strike=121.0,
             spot_price=120.0,
-            expiry=datetime.now(timezone.utc) + timedelta(days=90),
+            expiry=datetime.now(timezone.utc) + timedelta(days=120),
             confluence_score=2,
         )
         result = self.analyst.score(c)
@@ -141,6 +141,13 @@ class TestFlowAnalyst:
         )
         result = self.analyst.score(c)
         assert result.score < GATE_THRESHOLDS.flow_analyst_min
+
+    def test_low_adv_illiquidity_bonus(self):
+        """Very low contract ADV adds illiquidity bonus (dead chain tier)."""
+        c = _make_candidate(contract_avg_daily_volume=5)
+        result = self.analyst.score(c)
+        assert result.skipped is False
+        assert "dead_chain_adv_bonus" in result.signals
 
     def test_same_input_same_output(self):
         """Flow analyst must be perfectly deterministic."""

@@ -13,7 +13,7 @@ import structlog
 
 from grader.agents.flow_analyst import FlowAnalyst, candidate_to_flow
 from shared.db import get_db
-from shared.filters import GATE_THRESHOLDS
+from shared.filters import GATE_THRESHOLDS, GateThresholds
 from shared.models import Candidate, SubScore
 
 log = structlog.get_logger()
@@ -21,7 +21,10 @@ log = structlog.get_logger()
 _analyst = FlowAnalyst()
 
 
-async def run_gate1(candidate: Candidate) -> tuple[bool, SubScore]:
+async def run_gate1(
+    candidate: Candidate,
+    gate_cfg: GateThresholds | None = None,
+) -> tuple[bool, SubScore]:
     """Score a candidate through Gate 1.
 
     Returns:
@@ -32,9 +35,10 @@ async def run_gate1(candidate: Candidate) -> tuple[bool, SubScore]:
 
     await _log_score(candidate, sub_score)
 
+    thr = gate_cfg or GATE_THRESHOLDS
     passed = (
         not sub_score.skipped
-        and sub_score.score >= GATE_THRESHOLDS.flow_analyst_min
+        and sub_score.score >= thr.flow_analyst_min
     )
 
     if passed:

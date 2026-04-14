@@ -22,6 +22,8 @@ Design decisions:
 
 from __future__ import annotations
 
+from typing import Any
+
 import httpx
 import structlog
 
@@ -60,78 +62,25 @@ class Gate0Result:
         self.sector = sector
 
 
-async def run_gate0(
-    candidate: Candidate,
-    client: httpx.AsyncClient,
-    api_token: str,
-    config: UniverseConfig | None = None,
+def _gate0_result_from_info_payload(
+    ticker: str,
+    info: dict[str, Any],
+    cfg: UniverseConfig,
 ) -> Gate0Result:
-    """Run Gate 0 on a single candidate.
-
-    Steps:
-      1. Check static block lists (is_universe_blocked).
-      2. If not statically blocked, fetch /api/stock/{ticker}/info (cached 24h).
-      3. Check issue_type is in allowed_issue_types.
-      4. Check market cap is within [min_market_cap, max_market_cap].
-
-    Args:
-        candidate: The scanner candidate to check.
-        client: httpx.AsyncClient for API calls.
-        api_token: UW API token.
-        config: Optional UniverseConfig override (for testing).
-
-    Returns:
-        Gate0Result with passed=True if the ticker is in the target universe.
-    """
-    cfg = config or UNIVERSE_CONFIG
-    ticker = candidate.ticker.upper()
-
-    blocked, reason = is_universe_blocked(ticker)
-    if blocked:
-        log.info(
-            "gate0.blocked_static",
-            ticker=ticker,
-            reason=reason.value if reason else "unknown",
-        )
-        return Gate0Result(passed=False, reason=reason)
-
-    try:
-        info = await uw_get_json(
-            client,
-            f"{UW_BASE}/api/stock/{ticker}/info",
-            headers=uw_auth_headers(api_token),
-            use_cache=True,
-            cache_key=f"gate0:stock_info:{ticker}",
-            ttl_seconds=float(cfg.cache_ttl_seconds),
-        )
-    except Exception as exc:
-        log.warning(
-            "gate0.info_fetch_failed",
-            ticker=ticker,
-            error=str(exc),
-        )
-        return Gate0Result(passed=True)
-
-    data = info.get("data", info) if isinstance(info, dict) else {}
-    if isinstance(data, list) and len(data) > 0:
-        data = data[0]
-    if not isinstance(data, dict):
-        log.warning("gate0.info_unexpected_shape", ticker=ticker, shape=type(data).__name__)
-        return Gate0Result(passed=True)
-
+    """Apply universe rules to a normalized /stock/{{ticker}}/info ``data`` dict."""
     issue_type = (
-        data.get("issue_type")
-        or data.get("issueType")
-        or data.get("type")
+        info.get("issue_type")
+        or info.get("issueType")
+        or info.get("type")
         or ""
     )
     market_cap_raw = (
-        data.get("marketCap")
-        or data.get("market_cap")
-        or data.get("mktCap")
+        info.get("marketCap")
+        or info.get("market_cap")
+        or info.get("mktCap")
         or 0
     )
-    sector = data.get("sector") or data.get("sectorname") or None
+    sector = info.get("sector") or info.get("sectorname") or None
 
     try:
         market_cap = float(market_cap_raw)
@@ -184,3 +133,75 @@ async def run_gate0(
         issue_type=issue_type,
         sector=sector,
     )
+
+
+async def run_gate0(
+    candidate: Candidate,
+    client: httpx.AsyncClient,
+    api_token: str,
+    config: UniverseConfig | None = None,
+    stock_info_json: dict[str, Any] | None = None,
+) -> Gate0Result:
+    """Run Gate 0 on a single candidate.
+
+    Steps:
+      1. Check static block lists (is_universe_blocked).
+      2. If not statically blocked, fetch /api/stock/{ticker}/info (cached 24h).
+      3. Check issue_type is in allowed_issue_types.
+      4. Check market cap is within [min_market_cap, max_market_cap].
+
+    Args:
+        candidate: The scanner candidate to check.
+        client: httpx.AsyncClient for API calls.
+        api_token: UW API token.
+        config: Optional UniverseConfig override (for testing).
+
+    Returns:
+        Gate0Result with passed=True if the ticker is in the target universe.
+    """
+    cfg = config or UNIVERSE_CONFIG
+    ticker = candidate.ticker.upper()
+
+    blocked, reason = is_universe_blocked(ticker)
+    if blocked:
+        log.info(
+            "gate0.blocked_static",
+            ticker=ticker,
+            reason=reason.value if reason else "unknown",
+        )
+        return Gate0Result(passed=False, reason=reason)
+
+    if stock_info_json is not None:
+        data = stock_info_json.get("data", stock_info_json) if isinstance(stock_info_json, dict) else {}
+        if isinstance(data, list) and len(data) > 0:
+            data = data[0]
+        if not isinstance(data, dict):
+            log.warning("gate0.replay_info_unexpected_shape", ticker=ticker)
+            return Gate0Result(passed=True)
+        return _gate0_result_from_info_payload(ticker, data, cfg)
+
+    try:
+        info = await uw_get_json(
+            client,
+            f"{UW_BASE}/api/stock/{ticker}/info",
+            headers=uw_auth_headers(api_token),
+            use_cache=True,
+            cache_key=f"gate0:stock_info:{ticker}",
+            ttl_seconds=float(cfg.cache_ttl_seconds),
+        )
+    except Exception as exc:
+        log.warning(
+            "gate0.info_fetch_failed",
+            ticker=ticker,
+            error=str(exc),
+        )
+        return Gate0Result(passed=True)
+
+    data = info.get("data", info) if isinstance(info, dict) else {}
+    if isinstance(data, list) and len(data) > 0:
+        data = data[0]
+    if not isinstance(data, dict):
+        log.warning("gate0.info_unexpected_shape", ticker=ticker, shape=type(data).__name__)
+        return Gate0Result(passed=True)
+
+    return _gate0_result_from_info_payload(ticker, data, cfg)

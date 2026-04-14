@@ -325,15 +325,21 @@ class FlowScoringConfig:
     otm_slight_points: int = 3
     atm_itm_points: int = -3  # ATM or ITM = likely hedging
 
-    # Days to expiry
-    dte_weekly_max: int = 5  # 0-5 days
-    dte_weekly_points: int = 10
-    dte_near_max: int = 14  # 6-14 days
-    dte_near_points: int = 7
-    dte_swing_max: int = 30  # 15-30 days
-    dte_swing_points: int = 3
-    dte_long_min: int = 60  # 60+ days = likely hedging/LEAPS
+    # Days to expiry — informed positioning (21–90 DTE sweet spot)
+    dte_weekly_max: int = 5  # 0–5 = weeklies
+    dte_weekly_points: int = -10
+    dte_near_max: int = 20  # 6–20 = neutral corridor
+    dte_near_points: int = 0
+    dte_sweet_max: int = 90  # 21–90 = sweet spot
+    dte_sweet_points: int = 15
+    dte_long_min: int = 91  # 91+ = likely hedging / LEAPS
     dte_long_points: int = -5
+
+    # Optional contract ADV (contracts/day); populated on Candidate when known
+    illiquidity_dead_chain_adv_max: int = 10
+    illiquidity_dead_chain_points: int = 20
+    illiquidity_low_adv_max: int = 50
+    illiquidity_low_points: int = 10
 
     # Confluence bonus (scanner already requires 2+ signals)
     confluence_high_min: int = 5

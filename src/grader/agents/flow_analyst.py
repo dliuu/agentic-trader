@@ -74,6 +74,7 @@ def candidate_to_flow(candidate: Candidate) -> FlowCandidate:
         signals=signal_names,
         scanned_at=candidate.scanned_at,
         raw_data={},
+        contract_avg_daily_volume=candidate.contract_avg_daily_volume,
     )
 
 
@@ -107,6 +108,7 @@ class FlowAnalyst:
             candidate.strike, candidate.spot_price, score, signals, cfg
         )
         score, signals = self._score_dte(candidate.expiry, score, signals, cfg)
+        score, signals = self._score_illiquidity(candidate, score, signals, cfg)
         score, signals = self._score_confluence(
             candidate.confluence_score, score, signals, cfg
         )
@@ -203,16 +205,30 @@ class FlowAnalyst:
 
         if dte <= cfg.dte_weekly_max:
             score += cfg.dte_weekly_points
-            signals.append("weekly_expiry")
+            signals.append("weekly_dte_penalty")
         elif dte <= cfg.dte_near_max:
             score += cfg.dte_near_points
-            signals.append("near_term_expiry")
-        elif dte <= cfg.dte_swing_max:
-            score += cfg.dte_swing_points
-            signals.append("swing_expiry")
+            signals.append("near_term_dte_neutral")
+        elif dte <= cfg.dte_sweet_max:
+            score += cfg.dte_sweet_points
+            signals.append("sweet_spot_dte")
         elif dte >= cfg.dte_long_min:
             score += cfg.dte_long_points
-            signals.append("long_dated_expiry")
+            signals.append("long_dated_penalty")
+        return score, signals
+
+    def _score_illiquidity(
+        self, candidate: FlowCandidate, score: int, signals: list[str], cfg
+    ) -> tuple[int, list[str]]:
+        adv = candidate.contract_avg_daily_volume
+        if adv is None or adv < 0:
+            return score, signals
+        if adv < cfg.illiquidity_dead_chain_adv_max:
+            score += cfg.illiquidity_dead_chain_points
+            signals.append("dead_chain_adv_bonus")
+        elif adv < cfg.illiquidity_low_adv_max:
+            score += cfg.illiquidity_low_points
+            signals.append("low_liquidity_adv_bonus")
         return score, signals
 
     def _score_confluence(

@@ -48,7 +48,7 @@ filters:
   # Time to expiration
   expiry:
     enabled: true
-    max_dte: 14               # Near-term bets only (days to expiry)
+    max_dte: 90               # Informed positioning window (21–90 DTE sweet spot in flow analyst)
     min_dte: 1                # Skip 0DTE noise
 
   # Execution type
@@ -98,6 +98,10 @@ output:
 # Grader (Agent B) — LLM-powered trade grading
 grader:
   score_threshold: 70
+  # Gate score floors (override shared.filters.GateThresholds defaults when set)
+  gate1_min: 40
+  gate1_5_min: 50
+  gate2_min: 45
   model: "claude-sonnet-4-20250514"
   max_tokens: 512
   timeout_seconds: 15
@@ -165,8 +169,22 @@ tracker:
     spot_moved_away_per_5pct: -2        # penalty per 5% spot moves away from strike
     dte_pressure_below_14: -3           # penalty per day when DTE < 14
 
-# Re-grader — milestone LLM refresh (Gate 3 sentiment / insider / sector + synthesis blend)
+# Enrichment layer — Tier 2 continuous monitoring
 enrichment:
+  news:
+    enabled: true
+    headline_interval_seconds: 14400          # 4 hours
+    edgar_interval_seconds: 14400             # 4 hours
+    headline_limit: 20
+    edgar_lookback_days: 7
+    edgar_user_agent: "agentic-trader/1.0 your-email@example.com"
+
+  ledger:
+    enabled: true
+    purge_terminal_signals: true
+    retention_days: 30
+
+  # Re-grader — milestone LLM refresh (Gate 3 sentiment / insider / sector + synthesis blend)
   regrader:
     enabled: true
     max_regrades_per_signal: 5

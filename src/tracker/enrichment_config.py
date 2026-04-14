@@ -1,9 +1,16 @@
-"""Enrichment / re-grader settings loaded from rules.yaml `enrichment` section."""
+"""Enrichment layer settings loaded from rules.yaml `enrichment` section.
+
+This is the integration surface that wires:
+- Flow ledger aggregation
+- News watcher polling
+- LLM re-grader
+"""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 
+from tracker.config import LedgerConfig, NewsWatcherConfig
 
 @dataclass(frozen=True)
 class RegraderConfig:
@@ -32,12 +39,34 @@ class RegraderConfig:
 class EnrichmentConfig:
     """Top-level enrichment block from rules.yaml."""
 
+    news: NewsWatcherConfig = NewsWatcherConfig()
+    ledger: LedgerConfig = LedgerConfig()
     regrader: RegraderConfig = RegraderConfig()
 
 
-def load_enrichment_config(raw_config: dict) -> EnrichmentConfig:
+def load_enrichment_config(raw_config: dict) -> EnrichmentConfig | None:
     """Parse `enrichment` from the full config dict (e.g. load_config output)."""
     section = raw_config.get("enrichment") or {}
+    if not section:
+        return None
+
+    news_raw = section.get("news") or {}
+    news = NewsWatcherConfig(
+        enabled=bool(news_raw.get("enabled", True)),
+        headline_interval_seconds=int(news_raw.get("headline_interval_seconds", 14400)),
+        edgar_interval_seconds=int(news_raw.get("edgar_interval_seconds", 14400)),
+        headline_limit=int(news_raw.get("headline_limit", 20)),
+        edgar_lookback_days=int(news_raw.get("edgar_lookback_days", 7)),
+        edgar_user_agent=str(news_raw.get("edgar_user_agent", NewsWatcherConfig.edgar_user_agent)),
+    )
+
+    ledger_raw = section.get("ledger") or {}
+    ledger = LedgerConfig(
+        enabled=bool(ledger_raw.get("enabled", True)),
+        purge_terminal_signals=bool(ledger_raw.get("purge_terminal_signals", True)),
+        retention_days=int(ledger_raw.get("retention_days", 30)),
+    )
+
     rg = section.get("regrader") or {}
     regrader = RegraderConfig(
         enabled=bool(rg.get("enabled", True)),
@@ -54,4 +83,4 @@ def load_enrichment_config(raw_config: dict) -> EnrichmentConfig:
         max_news_events_in_prompt=int(rg.get("max_news_events_in_prompt", 10)),
         max_snapshots_in_prompt=int(rg.get("max_snapshots_in_prompt", 20)),
     )
-    return EnrichmentConfig(regrader=regrader)
+    return EnrichmentConfig(news=news, ledger=ledger, regrader=regrader)

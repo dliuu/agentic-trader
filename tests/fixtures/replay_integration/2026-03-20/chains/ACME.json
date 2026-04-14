@@ -1,0 +1,56 @@
+{
+  "data": [
+    {
+      "expiry": "2026-04-03",
+      "strike": 170.0,
+      "option_type": "call",
+      "open_interest": 50,
+      "volume": 10,
+      "bid": 1.0,
+      "ask": 1.1,
+      "underlying_price": 140.0,
+      "implied_volatility": 0.4,
+      "delta": 0.35,
+      "gamma": 0.01,
+      "theta": -0.05,
+      "vega": 0.12
+    },
+    {
+      "expiry": "2026-04-03",
+      "strike": 180.0,
+      "option_type": "call",
+      "open_interest": 100,
+      "volume": 500,
+      "bid": 2.0,
+      "ask": 2.2,
+      "underlying_price": 140.0,
+      "implied_volatility": 0.45,
+      "delta": 0.28,
+      "gamma": 0.02,
+      "theta": -0.08,
+      "vega": 0.15
+    },
+    {
+      "expiry": "2026-04-03",
+      "strike": 180.0,
+      "option_type": "put",
+      "open_interest": 80,
+      "volume": 5,
+      "bid": 3.0,
+      "ask": 3.2,
+      "underlying_price": 140.0,
+      "implied_volatility": 0.5
+    },
+    {
+      "expiry": "2026-04-03",
+      "strike": 190.0,
+      "option_type": "call",
+      "open_interest": 40,
+      "volume": 8,
+      "bid": 0.8,
+      "ask": 0.9,
+      "underlying_price": 140.0,
+      "implied_volatility": 0.42
+    }
+  ]
+}

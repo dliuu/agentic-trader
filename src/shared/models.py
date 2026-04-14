@@ -51,6 +51,8 @@ class Candidate(BaseModel):
     volume: int = 0
     open_interest: int = 0
     oi_change: float | None = None
+    # Option contract average daily volume (contracts/day) when known (e.g. from chain)
+    contract_avg_daily_volume: int | None = None
 
     scanned_at: datetime = Field(default_factory=datetime.utcnow)
     raw_alert_id: str
@@ -76,6 +78,7 @@ class FlowCandidate(BaseModel):
     signals: list[str]
     scanned_at: datetime
     raw_data: dict = Field(default_factory=dict)
+    contract_avg_daily_volume: int | None = None
 
 
 class SubScore(BaseModel):

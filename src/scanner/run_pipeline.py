@@ -9,6 +9,7 @@ import httpx
 from dotenv import load_dotenv
 
 from grader.main import run_grader
+from grader.llm_client import LLMClient
 from grader.models import ScoredTrade
 from scanner.main import run_scanner
 from scanner.utils.logging import setup_logging
@@ -44,37 +45,54 @@ async def main(force: bool = False, max_cycles: int | None = None):
         project_root = config_path.resolve().parent.parent
         scanner_db_path = str(project_root / scanner_db_path)
 
+    llm_client = None
+    if (
+        enrichment_cfg is not None
+        and enrichment_cfg.regrader.enabled
+        and config.get("anthropic_api_key")
+    ):
+        llm_client = LLMClient(
+            api_key=config["anthropic_api_key"],
+            model=enrichment_cfg.regrader.model,
+            max_tokens=enrichment_cfg.regrader.max_tokens,
+            timeout=enrichment_cfg.regrader.timeout_seconds,
+        )
+
     async with httpx.AsyncClient(timeout=15.0) as http_client:
-        tasks = [
-            run_scanner(
-                force=force,
-                max_cycles=max_cycles,
-                candidate_queue=candidate_queue,
-                uw_already_bootstrapped=True,
-            ),
-            run_grader(candidate_queue, scored_queue, uw_already_bootstrapped=True),
-        ]
-
-        if tracker_cfg.enabled:
-            tasks.append(
-                run_signal_intake(scored_queue, config=tracker_cfg)
-            )
-            tasks.append(
-                run_monitor(
-                    client=http_client,
-                    api_token=config["uw_api_token"],
-                    executor_queue=executor_queue,
-                    config=tracker_cfg,
-                    polling_config=config.get("polling"),
-                    scanner_db_path=scanner_db_path,
+        try:
+            tasks = [
+                run_scanner(
+                    force=force,
                     max_cycles=max_cycles,
-                    enrichment_cfg=enrichment_cfg,
-                    anthropic_api_key=config.get("anthropic_api_key", ""),
-                    finnhub_api_key=config.get("finnhub_api_key", ""),
-                )
-            )
+                    candidate_queue=candidate_queue,
+                    uw_already_bootstrapped=True,
+                ),
+                run_grader(candidate_queue, scored_queue, uw_already_bootstrapped=True),
+            ]
 
-        await asyncio.gather(*tasks)
+            if tracker_cfg.enabled:
+                tasks.append(
+                    run_signal_intake(scored_queue, config=tracker_cfg)
+                )
+                tasks.append(
+                    run_monitor(
+                        client=http_client,
+                        api_token=config["uw_api_token"],
+                        executor_queue=executor_queue,
+                        config=tracker_cfg,
+                        enrichment_config=enrichment_cfg,
+                        polling_config=config.get("polling"),
+                        scanner_db_path=scanner_db_path,
+                        llm_client=llm_client,
+                        finnhub_api_key=config.get("finnhub_api_key", ""),
+                        max_cycles=max_cycles,
+                    )
+                )
+
+            await asyncio.gather(*tasks)
+        finally:
+            if llm_client is not None:
+                await llm_client.close()
 
 
 def cli():

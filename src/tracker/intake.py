@@ -57,6 +57,8 @@ async def _process_scored_trade(
     scored_trade: ScoredTrade,
     store: SignalStore,
     cfg: TrackerConfig,
+    *,
+    created_at_override: datetime | None = None,
 ) -> None:
     """Convert a ScoredTrade to a Signal and persist it."""
     candidate = scored_trade.candidate
@@ -127,7 +129,7 @@ async def _process_scored_trade(
         conviction_score=float(score),
         oi_high_water=candidate.open_interest,
         cumulative_premium=candidate.premium_usd,
-        created_at=datetime.now(timezone.utc),
+        created_at=created_at_override or datetime.now(timezone.utc),
         risk_params_json=risk_json,
         anomaly_fingerprint=fingerprint,
     )

@@ -1034,7 +1034,7 @@ When **`enrichment.regrader.enabled`** is true and **`ANTHROPIC_API_KEY`** is se
 
 **Blend:** after deterministic **`new_conviction`** is computed for the cycle, a successful re-grade sets conviction to **`score_blend_deterministic_pct`** × that value plus **`score_blend_llm_pct`** × the synthesis score (defaults **55/45**). The snapshot’s **`conviction_after`** reflects the blended value. Rows are logged to **`regrades`**; **`SignalStore.get_regrade_history(signal_id)`** returns audit rows.
 
-**Config:** `src/tracker/enrichment_config.py` (`RegraderConfig`, `load_enrichment_config`); YAML under **`enrichment:`** in `config/rules.yaml`. **`scanner.run_pipeline`** passes **`anthropic_api_key`** and **`finnhub_api_key`** into **`run_monitor`** for client construction.
+**Config:** `src/tracker/enrichment_config.py` (`EnrichmentConfig`, `RegraderConfig`, `load_enrichment_config`); YAML under **`enrichment:`** in `config/rules.yaml`. **`scanner.run_pipeline`** constructs a shared `LLMClient` (from `ANTHROPIC_API_KEY`) and passes it into **`run_monitor(..., llm_client=..., enrichment_config=...)`** along with `finnhub_api_key`.
 
 **Note:** discovery-time **flow / vol / risk** sub-scores are not stored on **`Signal`**; re-grade synthesis receives the **initial Gate 3 synthesis score** as the frozen discovery summary plus the refreshed sentiment / insider / sector scores.
 

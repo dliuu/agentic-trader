@@ -28,3 +28,20 @@ def load_config(config_path: str | Path | None = None) -> dict:
     config["anthropic_api_key"] = os.environ.get("ANTHROPIC_API_KEY", "")
     config["finnhub_api_key"] = os.environ.get("FINNHUB_API_KEY", "")
     return config
+
+
+def gate_thresholds_from_config(config: dict | None):
+    """Build ``GateThresholds`` from ``rules.yaml`` ``grader`` keys (YAML overrides code defaults)."""
+    from shared.filters import GateThresholds as GT
+
+    if not config:
+        return GT()
+    g = config.get("grader") or {}
+    score_th = int(g.get("score_threshold", 70))
+    return GT(
+        flow_analyst_min=int(g.get("gate1_min", 40)),
+        gate1_5_combined_min=int(g.get("gate1_5_min", 50)),
+        gate2_avg_threshold=int(g.get("gate2_min", 45)),
+        deterministic_avg_min=int(g.get("gate2_min", 45)),
+        final_score_min=score_th,
+    )
