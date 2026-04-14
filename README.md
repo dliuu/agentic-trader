@@ -687,6 +687,8 @@ whale-scanner/
 │   │   ├── intake.py             # run_signal_intake — ScoredTrade → Signal (ticker + contract dedup)
 │   │   ├── monitor.py            # run_monitor — poll loop + ledger + news_watcher + snapshots + executor_queue
 │   │   ├── news_watcher.py       # UW headlines + SEC EDGAR EFTS, catalyst + persist news_events
+│   │   ├── regrader.py           # Milestone LLM re-grade + 55/45 blend + regrades table
+│   │   ├── enrichment_config.py # load_enrichment_config — regrader YAML (`enrichment.regrader`)
 │   │   └── signal_store.py       # SignalStore CRUD for signals + snapshots + watched-ticker helpers
 │   └── grader/
 │       ├── __init__.py
@@ -888,6 +890,7 @@ The `DedupCache` prevents the same trade from being flagged across consecutive p
 - `signal_snapshots` — time-series observations per signal (contract/neighborhood metrics, flow deltas, conviction delta/after, `signals_fired` JSON)
 - `flow_ledger` — append-only flow events for **watched** tickers (deduped by **`alert_id`**); scanner bypass path and monitor can both write; used for aggregates in conviction
 - `news_events` — deduped rows for **`NewsWatcher`** (UW headline IDs or EDGAR accession numbers in **`source_id`**); timeline for a future re-grader
+- `regrades` — one row per completed LLM re-grade (trigger, sub-scores, synthesis score/rationale, blend, token counts)
 
 ---
 
@@ -954,17 +957,18 @@ The **signal tracker** is a peer package under `src/tracker/` for **stateful mon
 | Typed config | `tracker.config` | `TrackerConfig`, `LedgerConfig`, **`NewsWatcherConfig`**, `ConvictionScoringConfig`, `load_tracker_config(dict)` |
 | Domain models | `tracker.models` | `Signal`, `SignalSnapshot`, **`LedgerEntry`**, **`LedgerAggregate`**, **`NewsEvent`**, **`NewsWatchResult`**, enums/constants, plus chain/flow DTOs |
 | Intake | `tracker.intake.run_signal_intake` | Async consumer of **`scored_queue`**; creates **`Signal`** rows (`PENDING`), honors **`max_active_signals`**, **skips if ticker already monitored** (`pending` / `accumulating` / `actionable`), then duplicate **contract** check |
-| Monitor | `tracker.monitor.run_monitor` | Interval from **`MarketClock`** + `poll_interval_*`; per active signal: poll chain, watch flow (including ledger), **`NewsWatcher.check()`** (UW + EDGAR on each source’s interval), persist new **`news_events`**, log **`regrade_recommended`**, **`ledger.aggregate`** → **`ConvictionEngine.evaluate(..., ledger_aggregate=..., news=...)`**, retention/terminal purge when configured, snapshot cap, DB update, **`executor_queue`** on first **`ACTIONABLE`** |
+| Monitor | `tracker.monitor.run_monitor` | Interval from **`MarketClock`** + `poll_interval_*`; per active signal: poll chain, watch flow (including ledger), **`NewsWatcher.check()`**, **`ledger.aggregate`** → **`ConvictionEngine.evaluate(...)`** → optional **`Regrader.maybe_regrade()`** (blend), snapshot cap, DB update (including **`regrade_count`** / **`milestones_fired`**), **`executor_queue`** on first **`ACTIONABLE`** |
 | Chain poller | `tracker.chain_poller.ChainPoller` | One UW call per poll to `/api/stock/{ticker}/option-chains`; `uw_get_json(..., use_cache=False)` |
 | Flow ledger | `tracker.flow_ledger.FlowLedger` | `record` / `record_batch` (`INSERT OR IGNORE` on **`alert_id`**), `aggregate`, `purge_terminal`, retention purge |
 | Flow watcher | `tracker.flow_watcher.FlowWatcher` | UW flow alerts + optional scanner **`candidates`** DB + **`_fetch_ledger_entries`** when ledger is wired (`output.sqlite_db_path` resolved in **`run_pipeline`**) |
-| News watcher | `tracker.news_watcher.NewsWatcher` | Rate-limited UW headlines; direct **`httpx`** GET to **`efts.sec.gov`** (requires compliant **`User-Agent`**); **`detect_catalysts()`**; dedup via **`news_events`**; **`get_events_for_signal()`** for future re-grader context |
+| News watcher | `tracker.news_watcher.NewsWatcher` | Rate-limited UW headlines; direct **`httpx`** GET to **`efts.sec.gov`** (requires compliant **`User-Agent`**); **`detect_catalysts()`**; dedup via **`news_events`**; **`get_events_for_signal()`** for enrichment / re-grader |
+| Re-grader | `tracker.regrader.Regrader` | Milestone checks, **`EnrichedLLMClient`**, agents + re-grade synthesis, blend, **`regrades`** persistence |
 | Scanner | `scanner.main` | When tracker+ledger enabled: splits flow alerts into **discovery** (dedup → engine → grade path) vs **watched** (writes **`flow_ledger`**; supplemental per-ticker UW fetch for sub-threshold flow) |
 | Conviction engine | `tracker.conviction.ConvictionEngine` | Pure scoring + state recommendation; optional **`ledger_aggregate`** and optional **`news`** (`+4` if **`has_catalyst`**, `+5` if SEC filing in-cycle) |
 | Pipeline wiring | `scanner.run_pipeline.main` | `async with httpx.AsyncClient` → `asyncio.gather(run_scanner, run_grader, [intake, monitor])`; passes **`max_cycles`** into **`run_monitor`** for bounded test runs |
 | Grader sentinel | `grader.main.run_grader` | After the candidate **`None`** sentinel, **`await scored_queue.put(None)`** so intake exits |
 | Persistence | `tracker.signal_store.SignalStore` | Async SQLite CRUD for **`signals`** / **`signal_snapshots`**; **`get_watched_tickers`**, **`get_ticker_signal_map`**, **`has_active_signal_for_ticker`** for scanner/intake |
-| Schema | `shared.db._ensure_tables` | `signals`, `signal_snapshots`, **`flow_ledger`** (+ indexes, **`UNIQUE(alert_id)`**), **`news_events`** alongside grader tables |
+| Schema | `shared.db._ensure_tables` | `signals` (+ **`regrade_count`**, **`last_regraded_at`**, **`milestones_fired`**), `signal_snapshots`, **`flow_ledger`**, **`news_events`**, **`regrades`** (+ migrations for existing DBs) |
 
 Load the tracker section after parsing YAML: `load_tracker_config(load_config(...))`.
 
@@ -1021,6 +1025,18 @@ The **news watcher** follows the **News Watcher** design (`news_watcher_design.m
 **SEC access:** EDGAR requests use **`https://efts.sec.gov/LATEST/search-index`** with a configurable **`edgar_user_agent`** (SEC expects contact information). Failures are logged and return an empty filing list so the monitor still runs on headlines.
 
 **Conviction:** when **`news.events`** is non-empty in a cycle, the engine adds **+4** if **`has_catalyst`** and **+5** if any SEC filing is present (same design as the conviction doc).
+
+### LLM re-grader
+
+When **`enrichment.regrader.enabled`** is true and **`ANTHROPIC_API_KEY`** is set, **`run_monitor`** constructs a **`Regrader`** (`tracker.regrader`) that can **re-run Gate 3’s sentiment and insider LLM agents** plus the **deterministic sector analyst**, then a **re-grade synthesis** Claude call. **`EnrichedLLMClient`** appends the same accumulated-evidence block to each agent user prompt (sector does not call the LLM).
+
+**Milestones (first match wins):** cumulative premium ≥ **`premium_multiple_trigger`** × initial; contract OI ≥ **`oi_multiple_trigger`** × initial; confirming flows ≥ **`confirming_flows_trigger`**; **`news.regrade_recommended`** (catalyst headline path); **`news.filing_detected`** (SEC path). Each fired milestone is appended to **`signals.milestones_fired`** (JSON) so it does not re-trigger. **Guards:** max **`max_regrades_per_signal`** (default 5), minimum **`min_interval_seconds`** (default 2h) since **`last_regraded_at`**, and no runs when the signal is already **terminal**.
+
+**Blend:** after deterministic **`new_conviction`** is computed for the cycle, a successful re-grade sets conviction to **`score_blend_deterministic_pct`** × that value plus **`score_blend_llm_pct`** × the synthesis score (defaults **55/45**). The snapshot’s **`conviction_after`** reflects the blended value. Rows are logged to **`regrades`**; **`SignalStore.get_regrade_history(signal_id)`** returns audit rows.
+
+**Config:** `src/tracker/enrichment_config.py` (`RegraderConfig`, `load_enrichment_config`); YAML under **`enrichment:`** in `config/rules.yaml`. **`scanner.run_pipeline`** passes **`anthropic_api_key`** and **`finnhub_api_key`** into **`run_monitor`** for client construction.
+
+**Note:** discovery-time **flow / vol / risk** sub-scores are not stored on **`Signal`**; re-grade synthesis receives the **initial Gate 3 synthesis score** as the frozen discovery summary plus the refreshed sentiment / insider / sector scores.
 
 ### Integration note
 
@@ -1090,12 +1106,12 @@ python -m pytest tests/test_risk_analyst.py -v --tb=short
 python -m pytest tests/test_gate0.py -v --tb=short
 
 # Signal tracker (models + SignalStore + chain poller + flow watcher + flow ledger)
-python -m pytest tests/test_tracker_models.py tests/test_signal_store.py tests/test_chain_poller.py tests/test_flow_watcher.py tests/test_flow_ledger.py tests/test_conviction.py tests/test_news_watcher.py -v
+python -m pytest tests/test_tracker_models.py tests/test_signal_store.py tests/test_chain_poller.py tests/test_flow_watcher.py tests/test_flow_ledger.py tests/test_conviction.py tests/test_news_watcher.py tests/test_regrader.py -v
 ```
 
 Install the project editable plus test (or dev) extras so `respx` and `pytest-asyncio` are present: `pip install -e ".[test,grader]"` (minimal for CI) or `pip install -e ".[dev,grader]"` (includes ruff/mypy). Pytest is configured with `pythonpath = ["src", "."]` in `pyproject.toml` so `grader`, `scanner`, `shared`, and `tracker` import from `src/` without setting `PYTHONPATH` manually.
 
-Notable suites: `tests/test_gate0.py`, `tests/test_gate1_5.py`, `tests/test_sector_cache.py`, `tests/test_vol_analyst.py`, `tests/test_risk_analyst.py`, `tests/test_sector_analyst.py`, `tests/test_sentiment_analyst.py`, `tests/test_insider_tracker.py`, `tests/test_flow_analyst.py`, `tests/test_tracker_models.py`, `tests/test_signal_store.py`, `tests/test_chain_poller.py`, `tests/test_flow_watcher.py`, `tests/test_flow_ledger.py`, `tests/test_conviction.py`, `tests/test_news_watcher.py`.
+Notable suites: `tests/test_gate0.py`, `tests/test_gate1_5.py`, `tests/test_sector_cache.py`, `tests/test_vol_analyst.py`, `tests/test_risk_analyst.py`, `tests/test_sector_analyst.py`, `tests/test_sentiment_analyst.py`, `tests/test_insider_tracker.py`, `tests/test_flow_analyst.py`, `tests/test_tracker_models.py`, `tests/test_signal_store.py`, `tests/test_chain_poller.py`, `tests/test_flow_watcher.py`, `tests/test_flow_ledger.py`, `tests/test_conviction.py`, `tests/test_news_watcher.py`, `tests/test_regrader.py`.
 
 If your default `python` is not 3.11+, run tests with `python3.11 -m pytest ...` (project requires Python 3.11+).
 

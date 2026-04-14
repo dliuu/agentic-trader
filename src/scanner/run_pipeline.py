@@ -16,6 +16,7 @@ from shared.config import load_config
 from shared.models import Candidate
 from shared.uw_validation import UWTokenError, bootstrap_uw_runtime_from_config
 from tracker.config import load_tracker_config
+from tracker.enrichment_config import load_enrichment_config
 from tracker.intake import run_signal_intake
 from tracker.models import Signal
 from tracker.monitor import run_monitor
@@ -31,6 +32,7 @@ async def main(force: bool = False, max_cycles: int | None = None):
     await bootstrap_uw_runtime_from_config(config)
 
     tracker_cfg = load_tracker_config(config)
+    enrichment_cfg = load_enrichment_config(config)
 
     candidate_queue: asyncio.Queue[Candidate] = asyncio.Queue()
     scored_queue: asyncio.Queue[ScoredTrade | None] = asyncio.Queue()
@@ -66,6 +68,9 @@ async def main(force: bool = False, max_cycles: int | None = None):
                     polling_config=config.get("polling"),
                     scanner_db_path=scanner_db_path,
                     max_cycles=max_cycles,
+                    enrichment_cfg=enrichment_cfg,
+                    anthropic_api_key=config.get("anthropic_api_key", ""),
+                    finnhub_api_key=config.get("finnhub_api_key", ""),
                 )
             )
 

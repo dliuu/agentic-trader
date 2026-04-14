@@ -85,6 +85,11 @@ class Signal(BaseModel):
     risk_params_json: str | None = None      # serialized TradeRiskParams
     anomaly_fingerprint: str = ""            # one-line summary
 
+    # --- LLM re-grader (milestone-triggered) ---
+    regrade_count: int = 0
+    last_regraded_at: datetime | None = None
+    milestones_fired: list[str] = Field(default_factory=list)
+
     @property
     def is_active(self) -> bool:
         return self.state in ACTIVE_STATES
@@ -306,3 +311,29 @@ class NewsWatchResult(BaseModel):
     catalyst_types: list[str] = Field(default_factory=list)
     filing_detected: bool = False
     regrade_recommended: bool = False
+
+
+class RegradeResult(BaseModel):
+    """Output of a single LLM re-grade cycle."""
+
+    model_config = {"extra": "forbid"}
+
+    signal_id: str
+    triggered: bool = False
+    trigger_reason: str | None = None
+    skipped_reason: str | None = None
+
+    sentiment_score: int | None = None
+    insider_score: int | None = None
+    sector_score: int | None = None
+    synthesis_score: int | None = None
+    synthesis_rationale: str | None = None
+
+    deterministic_conviction: float | None = None
+    blended_conviction: float | None = None
+
+    total_input_tokens: int = 0
+    total_output_tokens: int = 0
+    total_latency_ms: int = 0
+
+    regraded_at: datetime | None = None

@@ -164,3 +164,18 @@ tracker:
     silence_penalty_per_day: -4         # penalty per day of no new flow (after silence_decay_days)
     spot_moved_away_per_5pct: -2        # penalty per 5% spot moves away from strike
     dte_pressure_below_14: -3           # penalty per day when DTE < 14
+
+# Re-grader — milestone LLM refresh (Gate 3 sentiment / insider / sector + synthesis blend)
+enrichment:
+  regrader:
+    enabled: true
+    max_regrades_per_signal: 5
+    min_interval_seconds: 7200
+    score_blend_deterministic_pct: 55.0
+    score_blend_llm_pct: 45.0
+    premium_multiple_trigger: 2.0
+    oi_multiple_trigger: 3.0
+    confirming_flows_trigger: 3
+    model: "claude-sonnet-4-20250514"
+    max_tokens: 512
+    timeout_seconds: 15.0

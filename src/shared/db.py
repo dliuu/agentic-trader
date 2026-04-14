@@ -83,6 +83,9 @@ async def _ensure_tables(db: aiosqlite.Connection) -> None:
             terminal_reason TEXT,
             risk_params_json TEXT,
             anomaly_fingerprint TEXT DEFAULT '',
+            regrade_count INTEGER NOT NULL DEFAULT 0,
+            last_regraded_at TEXT,
+            milestones_fired TEXT DEFAULT '[]',
             FOREIGN KEY (grade_id) REFERENCES grades(id)
         );
         CREATE INDEX IF NOT EXISTS idx_signals_state ON signals(state);
@@ -162,6 +165,51 @@ async def _ensure_tables(db: aiosqlite.Connection) -> None:
         CREATE INDEX IF NOT EXISTS idx_news_ticker ON news_events(ticker);
         CREATE INDEX IF NOT EXISTS idx_news_source_id ON news_events(source_id);
         CREATE INDEX IF NOT EXISTS idx_news_detected ON news_events(detected_at);
+
+        CREATE TABLE IF NOT EXISTS regrades (
+            id TEXT PRIMARY KEY,
+            signal_id TEXT NOT NULL,
+            trigger_reason TEXT NOT NULL,
+            sentiment_score INTEGER,
+            insider_score INTEGER,
+            sector_score INTEGER,
+            synthesis_score INTEGER,
+            synthesis_rationale TEXT,
+            deterministic_conviction REAL,
+            blended_conviction REAL,
+            input_tokens INTEGER NOT NULL DEFAULT 0,
+            output_tokens INTEGER NOT NULL DEFAULT 0,
+            latency_ms INTEGER NOT NULL DEFAULT 0,
+            regraded_at TEXT NOT NULL,
+            FOREIGN KEY (signal_id) REFERENCES signals(id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_regrades_signal ON regrades(signal_id);
         """
     )
     await db.commit()
+    await _migrate_signals_regrader_columns(db)
+
+
+async def _migrate_signals_regrader_columns(db: aiosqlite.Connection) -> None:
+    """Add re-grader columns to existing signals DBs (CREATE IF NOT EXISTS skips new cols)."""
+    cur = await db.execute("PRAGMA table_info(signals)")
+    rows = await cur.fetchall()
+    colnames = {str(r[1]) for r in rows}
+    migrations: list[str] = []
+    if "regrade_count" not in colnames:
+        migrations.append(
+            "ALTER TABLE signals ADD COLUMN regrade_count INTEGER NOT NULL DEFAULT 0"
+        )
+    if "last_regraded_at" not in colnames:
+        migrations.append("ALTER TABLE signals ADD COLUMN last_regraded_at TEXT")
+    if "milestones_fired" not in colnames:
+        migrations.append(
+            "ALTER TABLE signals ADD COLUMN milestones_fired TEXT DEFAULT '[]'"
+        )
+    for stmt in migrations:
+        try:
+            await db.execute(stmt)
+        except Exception:
+            pass
+    if migrations:
+        await db.commit()

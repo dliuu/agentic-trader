@@ -7,6 +7,7 @@ For each active signal, every poll cycle:
   3. Watch for new flow (flow_watcher)
   3.5 Poll headlines + SEC EDGAR on cadence (news_watcher), persist catalyst rows
   4. Evaluate conviction (conviction engine)
+  4.5 Optional LLM re-grade (milestone-triggered) — blend into conviction before snapshot
   5. Persist snapshot + update signal state
   6. Push actionable signals to the executor queue
 """
@@ -26,8 +27,10 @@ from tracker.config import TrackerConfig
 from tracker.conviction import ConvictionEngine
 from tracker.flow_ledger import FlowLedger, ledger_entry_from_flow_event
 from tracker.flow_watcher import FlowWatcher
-from tracker.models import Signal, SignalSnapshot, SignalState
+from tracker.enrichment_config import EnrichmentConfig
+from tracker.models import RegradeResult, Signal, SignalSnapshot, SignalState, TERMINAL_STATES
 from tracker.news_watcher import NewsWatcher
+from tracker.regrader import Regrader
 from tracker.signal_store import SignalStore
 
 log = structlog.get_logger()
@@ -42,6 +45,9 @@ async def run_monitor(
     scanner_db_path: str | None = None,
     *,
     max_cycles: int | None = None,
+    enrichment_cfg: EnrichmentConfig | None = None,
+    anthropic_api_key: str = "",
+    finnhub_api_key: str = "",
 ) -> None:
     """Main monitor loop.
 
@@ -53,6 +59,9 @@ async def run_monitor(
         polling_config: The 'polling' section from rules.yaml (for MarketClock).
         scanner_db_path: Path to the scanner's SQLite DB for flow watcher.
         max_cycles: If set, run at most N cycles then exit (for testing).
+        enrichment_cfg: Optional `enrichment` block (re-grader settings).
+        anthropic_api_key: Claude API key for re-grader (optional).
+        finnhub_api_key: Finnhub key for sentiment/insider context in re-grade.
     """
     cfg = config or TrackerConfig()
 
@@ -71,6 +80,31 @@ async def run_monitor(
     )
     news_watcher = NewsWatcher(client, api_token, config=cfg.news)
     engine = ConvictionEngine(config=cfg)
+
+    regrader: Regrader | None = None
+    enc = enrichment_cfg or EnrichmentConfig()
+    if enc.regrader.enabled and anthropic_api_key.strip():
+        try:
+            from grader.llm_client import LLMClient
+
+            llm = LLMClient(
+                api_key=anthropic_api_key.strip(),
+                model=enc.regrader.model,
+                max_tokens=enc.regrader.max_tokens,
+                timeout=enc.regrader.timeout_seconds,
+            )
+            regrader = Regrader(
+                llm,
+                client,
+                api_token,
+                finnhub_api_key or "",
+                store,
+                config=enc.regrader,
+                news_watcher=news_watcher,
+            )
+            log.info("monitor.regrader_enabled")
+        except Exception as exc:
+            log.warning("monitor.regrader_init_failed", error=str(exc))
 
     # Build market clock for hours detection
     clock = None
@@ -118,6 +152,7 @@ async def run_monitor(
                     poller,
                     watcher,
                     news_watcher,
+                    regrader,
                     engine,
                     executor_queue,
                     cfg,
@@ -160,6 +195,7 @@ async def _process_signal(
     poller: ChainPoller,
     watcher: FlowWatcher,
     news_watcher: NewsWatcher,
+    regrader: Regrader | None,
     engine: ConvictionEngine,
     executor_queue: asyncio.Queue[Signal],
     cfg: TrackerConfig,
@@ -217,13 +253,55 @@ async def _process_signal(
         signal, chain, flow, prev_snapshot, ledger_aggregate=ledger_agg, news=news
     )
 
-    # 5. Compute new values
-    new_conviction = max(0.0, min(100.0,
-        signal.conviction_score + result.conviction_delta
-    ))
+    # 5. Compute new values (deterministic conviction this cycle)
+    new_conviction = max(
+        0.0,
+        min(100.0, signal.conviction_score + result.conviction_delta),
+    )
     new_confirming = signal.confirming_flows + len(flow.events)
     new_cumulative = signal.cumulative_premium + sum(e.premium for e in flow.events)
     new_state = result.next_state or signal.state
+
+    regrade = RegradeResult(signal_id=signal.id, triggered=False)
+    milestone_signal = signal.model_copy(
+        update={
+            "cumulative_premium": new_cumulative,
+            "confirming_flows": new_confirming,
+        }
+    )
+    if (
+        regrader is not None
+        and new_state not in TERMINAL_STATES
+    ):
+        try:
+            regrade = await regrader.maybe_regrade(
+                signal,
+                chain,
+                flow,
+                news,
+                ledger_agg,
+                new_conviction,
+                signal_for_milestones=milestone_signal,
+            )
+        except Exception as exc:
+            log.warning(
+                "monitor.regrade_failed",
+                signal_id=signal.id,
+                ticker=signal.ticker,
+                error=str(exc),
+            )
+
+    if regrade.triggered and regrade.blended_conviction is not None:
+        new_conviction = regrade.blended_conviction
+        log.info(
+            "monitor.conviction_blended",
+            signal_id=signal.id,
+            ticker=signal.ticker,
+            deterministic=round(regrade.deterministic_conviction or 0, 1),
+            llm_score=regrade.synthesis_score,
+            blended=round(new_conviction, 1),
+            trigger=regrade.trigger_reason,
+        )
 
     # 6. Build and persist snapshot
     # Compute spread percentage
@@ -284,6 +362,13 @@ async def _process_signal(
 
     if flow.events:
         update_fields["last_flow_at"] = now
+
+    if regrade.triggered and regrade.regraded_at is not None:
+        update_fields["regrade_count"] = signal.regrade_count + 1
+        update_fields["last_regraded_at"] = regrade.regraded_at
+        update_fields["milestones_fired"] = list(signal.milestones_fired) + [
+            regrade.trigger_reason or ""
+        ]
 
     if new_state == SignalState.ACTIONABLE and signal.state != SignalState.ACTIONABLE:
         update_fields["matured_at"] = now

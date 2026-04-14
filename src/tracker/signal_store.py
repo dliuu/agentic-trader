@@ -19,6 +19,20 @@ from tracker.models import (
 log = structlog.get_logger()
 
 
+def _parse_milestones_fired(raw: object) -> list[str]:
+    if raw is None or raw == "":
+        return []
+    if isinstance(raw, list):
+        return [str(x) for x in raw]
+    if isinstance(raw, str):
+        try:
+            data = json.loads(raw)
+            return [str(x) for x in data] if isinstance(data, list) else []
+        except (json.JSONDecodeError, TypeError):
+            return []
+    return []
+
+
 class SignalStore:
     """CRUD operations for the signals and signal_snapshots tables."""
 
@@ -35,8 +49,8 @@ class SignalStore:
                     chain_spread_count, cumulative_premium, days_without_flow,
                     created_at, last_polled_at, last_flow_at, matured_at,
                     terminal_at, terminal_reason, risk_params_json,
-                    anomaly_fingerprint)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    anomaly_fingerprint, regrade_count, last_regraded_at, milestones_fired)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
                     signal.id,
                     signal.ticker,
@@ -66,6 +80,9 @@ class SignalStore:
                     signal.terminal_reason,
                     signal.risk_params_json,
                     signal.anomaly_fingerprint,
+                    signal.regrade_count,
+                    signal.last_regraded_at.isoformat() if signal.last_regraded_at else None,
+                    json.dumps(signal.milestones_fired),
                 ),
             )
             await db.commit()
@@ -138,6 +155,8 @@ class SignalStore:
                 values.append(val.isoformat())
             elif isinstance(val, SignalState):
                 values.append(val.value)
+            elif isinstance(val, list):
+                values.append(json.dumps(val))
             else:
                 values.append(val)
         values.append(signal_id)
@@ -213,6 +232,20 @@ class SignalStore:
         """Fetch the most recent snapshot for a signal."""
         snapshots = await self.get_snapshots(signal_id, limit=1)
         return snapshots[0] if snapshots else None
+
+    async def get_regrade_history(self, signal_id: str, limit: int = 50) -> list[dict]:
+        """Rows from `regrades` for audit / debugging."""
+        db = await get_db()
+        try:
+            cursor = await db.execute(
+                "SELECT * FROM regrades WHERE signal_id = ? ORDER BY regraded_at DESC LIMIT ?",
+                (signal_id, limit),
+            )
+            rows = await cursor.fetchall()
+            columns = [d[0] for d in cursor.description]
+            return [dict(zip(columns, row)) for row in rows]
+        finally:
+            await db.close()
 
     async def check_duplicate_signal(self, ticker: str, strike: float, expiry: str) -> bool:
         """Check if an active signal already exists for this contract."""
@@ -328,6 +361,13 @@ class SignalStore:
             terminal_reason=row.get("terminal_reason"),
             risk_params_json=row.get("risk_params_json"),
             anomaly_fingerprint=row.get("anomaly_fingerprint", ""),
+            regrade_count=int(row.get("regrade_count", 0)),
+            last_regraded_at=(
+                datetime.fromisoformat(row["last_regraded_at"])
+                if row.get("last_regraded_at")
+                else None
+            ),
+            milestones_fired=_parse_milestones_fired(row.get("milestones_fired")),
         )
 
     @staticmethod
