@@ -2,10 +2,12 @@
 
 import argparse
 import asyncio
+import signal as signal_mod
 import sys
 from pathlib import Path
 
 import httpx
+import structlog
 from dotenv import load_dotenv
 
 from grader.main import run_grader
@@ -21,8 +23,12 @@ from tracker.enrichment_config import load_enrichment_config
 from tracker.intake import run_signal_intake
 from tracker.models import Signal
 from tracker.monitor import run_monitor
+from tracker.operations_config import load_operations_config
+from tracker.portfolio_config import load_portfolio_config
 
 load_dotenv()
+
+_pipeline_log = structlog.get_logger(__name__)
 
 
 async def main(force: bool = False, max_cycles: int | None = None):
@@ -32,8 +38,19 @@ async def main(force: bool = False, max_cycles: int | None = None):
     config = load_config(config_path)
     await bootstrap_uw_runtime_from_config(config)
 
+    shutdown_event = asyncio.Event()
+
+    def handle_shutdown(signum, frame):
+        _pipeline_log.info("pipeline.shutdown_requested", signal=signum)
+        shutdown_event.set()
+
+    signal_mod.signal(signal_mod.SIGTERM, handle_shutdown)
+    signal_mod.signal(signal_mod.SIGINT, handle_shutdown)
+
     tracker_cfg = load_tracker_config(config)
     enrichment_cfg = load_enrichment_config(config)
+    operations_cfg = load_operations_config(config)
+    portfolio_cfg = load_portfolio_config(config)
 
     candidate_queue: asyncio.Queue[Candidate] = asyncio.Queue()
     scored_queue: asyncio.Queue[ScoredTrade | None] = asyncio.Queue()
@@ -66,8 +83,14 @@ async def main(force: bool = False, max_cycles: int | None = None):
                     max_cycles=max_cycles,
                     candidate_queue=candidate_queue,
                     uw_already_bootstrapped=True,
+                    shutdown_event=shutdown_event,
                 ),
-                run_grader(candidate_queue, scored_queue, uw_already_bootstrapped=True),
+                run_grader(
+                    candidate_queue,
+                    scored_queue,
+                    uw_already_bootstrapped=True,
+                    shutdown_event=shutdown_event,
+                ),
             ]
 
             if tracker_cfg.enabled:
@@ -86,6 +109,9 @@ async def main(force: bool = False, max_cycles: int | None = None):
                         llm_client=llm_client,
                         finnhub_api_key=config.get("finnhub_api_key", ""),
                         max_cycles=max_cycles,
+                        operations=operations_cfg,
+                        shutdown_event=shutdown_event,
+                        portfolio_config=portfolio_cfg,
                     )
                 )
 
@@ -97,9 +123,14 @@ async def main(force: bool = False, max_cycles: int | None = None):
 
 def cli():
     project_root = Path(__file__).resolve().parent.parent.parent
+    config_path = project_root / "config" / "rules.yaml"
+    config = load_config(config_path) if config_path.exists() else {}
+    log_cfg = config.get("logging") or {}
     setup_logging(
         json_logs=True,
         log_file_path=project_root / "scanner.json.log",
+        max_bytes=int(log_cfg.get("max_file_size_mb", 50)) * 1_000_000,
+        backup_count=int(log_cfg.get("backup_count", 5)),
     )
     parser = argparse.ArgumentParser()
     parser.add_argument("--force", action="store_true", help="Ignore market hours")

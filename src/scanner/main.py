@@ -59,6 +59,7 @@ async def run_scanner(
     candidate_queue: asyncio.Queue | None = None,
     *,
     uw_already_bootstrapped: bool = False,
+    shutdown_event: asyncio.Event | None = None,
 ):
     config_path = Path(__file__).resolve().parent.parent.parent / "config" / "rules.yaml"
     if not config_path.exists():
@@ -104,6 +105,10 @@ async def run_scanner(
 
     try:
         while max_cycles is None or cycle_count < max_cycles:
+            if shutdown_event is not None and shutdown_event.is_set():
+                logger.info("scanner.shutdown_graceful")
+                break
+
             if not force and not clock.is_market_hours():
                 wait = clock.seconds_until_open()
                 logger.info("market_closed", sleep_seconds=wait)
@@ -282,16 +287,25 @@ async def run_scanner(
     finally:
         await client.close()
         await db.close()
-        if candidate_queue is not None:
-            await queue.put(None)  # Sentinel to signal grader to exit
+        if candidate_queue is not None and not isinstance(candidate_queue, CandidateQueue):
+            await queue.put(None)  # Sentinel so grader exits (asyncio.Queue only)
         logger.info("scanner_stopped")
 
 
 def main():
     project_root = Path(__file__).resolve().parent.parent.parent
+    cfg_path = project_root / "config" / "rules.yaml"
+    raw = {}
+    if cfg_path.exists():
+        import yaml
+
+        raw = yaml.safe_load(cfg_path.read_text()) or {}
+    log_cfg = raw.get("logging") or {}
     setup_logging(
         json_logs=True,
         log_file_path=project_root / "scanner.json.log",
+        max_bytes=int(log_cfg.get("max_file_size_mb", 50)) * 1_000_000,
+        backup_count=int(log_cfg.get("backup_count", 5)),
     )
     parser = argparse.ArgumentParser()
     parser.add_argument("--force", action="store_true", help="Ignore market hours")

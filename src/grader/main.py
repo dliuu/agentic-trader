@@ -36,6 +36,7 @@ async def run_grader(
     scored_queue: asyncio.Queue[ScoredTrade | None],
     *,
     uw_already_bootstrapped: bool = False,
+    shutdown_event: asyncio.Event | None = None,
 ) -> None:
     """Consumer loop: pull candidates, grade them, push passing trades."""
     config_path = Path(__file__).resolve().parent.parent.parent / "config" / "rules.yaml"
@@ -93,114 +94,117 @@ async def run_grader(
             )
             aggregator = Aggregator()
 
-        while True:
-            candidate = await candidate_queue.get()
+        try:
+            while True:
+                if shutdown_event is not None and shutdown_event.is_set():
+                    log.info("grader.shutdown_graceful")
+                    break
 
-            if candidate is None:
-                break
+                candidate = await candidate_queue.get()
 
-            gate0_result = await run_gate0(candidate, http_client, config["uw_api_token"])
-            if not gate0_result.passed:
-                log.info(
-                    "pipeline.gate0_reject",
-                    ticker=candidate.ticker,
-                    reason=gate0_result.reason.value if gate0_result.reason else "unknown",
-                )
-                candidate_queue.task_done()
-                continue
+                if candidate is None:
+                    break
 
-            passed_gate1, flow_score = await run_gate1(candidate, gate_cfg=gate_thr)
-            if not passed_gate1:
-                candidate_queue.task_done()
-                continue
-
-            gate1_5_result = await run_gate1_5(
-                candidate=candidate,
-                flow_score=flow_score,
-                client=http_client,
-                api_token=config["uw_api_token"],
-                scanner_db_path=scanner_db_path,
-                sector=gate0_result.sector,
-                gate_cfg=gate_thr,
-            )
-            if not gate1_5_result.passed:
-                log.info(
-                    "pipeline.gate1_5_reject",
-                    ticker=candidate.ticker,
-                    flow_score=flow_score.score,
-                    penalty=gate1_5_result.penalty,
-                    combined=gate1_5_result.combined_score,
-                    reasons=gate1_5_result.reasons,
-                )
-                candidate_queue.task_done()
-                continue
-
-            if not grader_cfg.get("enabled", True):
-                # Pass-through mode: skip Gate 2 + LLM grading and forward Gate 1 survivors.
-                await scored_queue.put(
-                    ScoredTrade(
-                        candidate=candidate,
-                        grade=None,
-                        risk=None,
-                        graded_at=datetime.now(timezone.utc),
-                        model_used="pass-through",
-                        latency_ms=0,
-                        input_tokens=0,
-                        output_tokens=0,
+                gate0_result = await run_gate0(candidate, http_client, config["uw_api_token"])
+                if not gate0_result.passed:
+                    log.info(
+                        "pipeline.gate0_reject",
+                        ticker=candidate.ticker,
+                        reason=gate0_result.reason.value if gate0_result.reason else "unknown",
                     )
+                    candidate_queue.task_done()
+                    continue
+
+                passed_gate1, flow_score = await run_gate1(candidate, gate_cfg=gate_thr)
+                if not passed_gate1:
+                    candidate_queue.task_done()
+                    continue
+
+                gate1_5_result = await run_gate1_5(
+                    candidate=candidate,
+                    flow_score=flow_score,
+                    client=http_client,
+                    api_token=config["uw_api_token"],
+                    scanner_db_path=scanner_db_path,
+                    sector=gate0_result.sector,
+                    gate_cfg=gate_thr,
                 )
+                if not gate1_5_result.passed:
+                    log.info(
+                        "pipeline.gate1_5_reject",
+                        ticker=candidate.ticker,
+                        flow_score=flow_score.score,
+                        penalty=gate1_5_result.penalty,
+                        combined=gate1_5_result.combined_score,
+                        reasons=gate1_5_result.reasons,
+                    )
+                    candidate_queue.task_done()
+                    continue
+
+                if not grader_cfg.get("enabled", True):
+                    # Pass-through mode: skip Gate 2 + LLM grading and forward Gate 1 survivors.
+                    await scored_queue.put(
+                        ScoredTrade(
+                            candidate=candidate,
+                            grade=None,
+                            risk=None,
+                            graded_at=datetime.now(timezone.utc),
+                            model_used="pass-through",
+                            latency_ms=0,
+                            input_tokens=0,
+                            output_tokens=0,
+                        )
+                    )
+                    candidate_queue.task_done()
+                    continue
+
+                # Gate 2: deterministic volatility + risk in parallel.
+                sector_cache = await get_sector_cache(
+                    http_client,
+                    config["uw_api_token"],
+                    min_refresh_interval_seconds=sector_refresh,
+                    max_fetch_concurrency=sector_conc,
+                )
+                passed_gate2, vol_score, risk_score = await run_gate2(
+                    candidate=candidate,
+                    flow_score=flow_score,
+                    client=http_client,
+                    api_token=config["uw_api_token"],
+                    sector_cache=sector_cache,
+                    gate_cfg=gate_thr,
+                )
+                if not passed_gate2:
+                    candidate_queue.task_done()
+                    continue
+
+                if (
+                    sentiment_agent is None
+                    or insider_agent is None
+                    or sector_agent is None
+                    or synthesis_agent is None
+                    or aggregator is None
+                ):
+                    candidate_queue.task_done()
+                    continue
+
+                scored_trade = await run_gate3(
+                    candidate=candidate,
+                    flow_score=flow_score,
+                    vol_score=vol_score,
+                    risk_score=risk_score,
+                    sentiment=sentiment_agent,
+                    insider=insider_agent,
+                    sector=sector_agent,
+                    synthesis_agent=synthesis_agent,
+                    aggregator=aggregator,
+                    final_threshold=grader_cfg["score_threshold"],
+                    gate_cfg=gate_thr,
+                )
+                if scored_trade is not None:
+                    await scored_queue.put(scored_trade)
+
                 candidate_queue.task_done()
-                continue
-
-            # Gate 2: deterministic volatility + risk in parallel.
-            sector_cache = await get_sector_cache(
-                http_client,
-                config["uw_api_token"],
-                min_refresh_interval_seconds=sector_refresh,
-                max_fetch_concurrency=sector_conc,
-            )
-            passed_gate2, vol_score, risk_score = await run_gate2(
-                candidate=candidate,
-                flow_score=flow_score,
-                client=http_client,
-                api_token=config["uw_api_token"],
-                sector_cache=sector_cache,
-                gate_cfg=gate_thr,
-            )
-            if not passed_gate2:
-                candidate_queue.task_done()
-                continue
-
-            if (
-                sentiment_agent is None
-                or insider_agent is None
-                or sector_agent is None
-                or synthesis_agent is None
-                or aggregator is None
-            ):
-                candidate_queue.task_done()
-                continue
-
-            scored_trade = await run_gate3(
-                candidate=candidate,
-                flow_score=flow_score,
-                vol_score=vol_score,
-                risk_score=risk_score,
-                sentiment=sentiment_agent,
-                insider=insider_agent,
-                sector=sector_agent,
-                synthesis_agent=synthesis_agent,
-                aggregator=aggregator,
-                final_threshold=grader_cfg["score_threshold"],
-                gate_cfg=gate_thr,
-            )
-            if scored_trade is not None:
-                await scored_queue.put(scored_trade)
-
-            candidate_queue.task_done()
-
-        # Signal to intake that grading is done
-        await scored_queue.put(None)
-
-        if llm is not None:
-            await llm.close()
+        finally:
+            await scored_queue.put(None)
+            if llm is not None:
+                await llm.close()

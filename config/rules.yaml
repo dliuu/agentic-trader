@@ -197,3 +197,37 @@ enrichment:
     model: "claude-sonnet-4-20250514"
     max_tokens: 512
     timeout_seconds: 15.0
+
+# Portfolio guardrails — hard limits before executor queue (see tracker/guardrails.py)
+portfolio:
+  max_total_capital_usd: 50000
+  max_single_position_pct: 5.0
+  max_single_position_usd: 2500
+  max_total_exposure_pct: 25.0
+  max_total_exposure_usd: 12500
+  max_signals_per_sector: 2
+  max_signals_per_ticker: 1
+  max_concurrent_positions: 5
+  max_single_loss_pct: 2.0
+  daily_loss_limit_pct: 5.0
+  min_option_volume: 50
+  max_bid_ask_spread_pct: 15.0
+
+# Logging (``scanner.run_pipeline`` CLI — rotating ``scanner.json.log``)
+logging:
+  max_file_size_mb: 50
+  backup_count: 5
+
+# Operations — DB cleanup cadence, monitor circuit breaker
+operations:
+  cleanup:
+    ledger_retention_days: 30
+    snapshot_retention_days: 30
+    news_retention_days: 30
+    regrade_retention_days: 60
+    terminal_signal_retention_days: 90
+    purge_terminal_signals: true
+    db_size_warning_mb: 500
+  circuit_breaker:
+    max_consecutive_failures: 10
+    backoff_multiplier: 4

@@ -1,0 +1,27 @@
+[Unit]
+Description=Agentic Trader Pipeline
+After=network.target
+
+[Service]
+Type=simple
+User=trader
+WorkingDirectory=/opt/agentic-trader
+ExecStart=/opt/agentic-trader/.venv/bin/python -m scanner.run_pipeline --force
+Restart=on-failure
+RestartSec=30
+Environment=PYTHONPATH=/opt/agentic-trader/src
+EnvironmentFile=/opt/agentic-trader/.env
+
+MemoryMax=1G
+CPUQuota=50%
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=agentic-trader
+
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=/opt/agentic-trader/data
+
+[Install]
+WantedBy=multi-user.target

@@ -9,7 +9,9 @@ A multi-gate pipeline for unusual options flow:
 - **Gate 2 (Volatility Analyst + Risk Analyst)** — Deterministic “is the buyer getting a good deal?” layer **after** Gate 1.5. The **Volatility Analyst** fetches 4 UW volatility/chain endpoints per candidate (no LLM), and the **Risk Analyst** scores structural conviction from buyer risk accepted (premium, DTE, spread, OTM distance, move ratio, liquidity, earnings proximity). Gate 2 passes when the average of (**unchanged** Gate 1 flow `SubScore`, vol, risk) meets the configured threshold.
 - **Gate 3 (Specialists + synthesis)** — Runs **Sentiment Analyst**, **Insider Tracker**, and a deterministic **Sector Analyst** in parallel (each emits a `SubScore`). Those scores are merged with Gate 1–2 sub-scores into a **deterministic aggregator** (weighted average, disagreement, six conflict detectors). The **flow analyst** `SubScore` here is still the **raw Gate 1 score** (Gate 1.5 only gates progression; it does not rewrite the sub-score passed to aggregation). A final **Synthesis** step makes **one** Claude call to produce the 1–100 score, applies deterministic caps, merges position sizing with the risk analyst, and emits a passing `ScoredTrade` if the score meets the threshold. See [Synthesis layer (Gate 3)](#synthesis-layer-gate-3) and the specialist sections below.
 
-**Key features:** Confluence enrichment (dark pool + market tide), **Gate 0** universe filter (static lists + cached UW stock info), deterministic **Gates 1 → 1.5 → 2** before most LLM spend (Gate 1.5 adds a small UW footprint but avoids expensive Gates 2–3 on “explained” flow), Gate 3 uses three specialist calls plus one synthesis call (not the legacy single-shot context grader in production), optional `GATE0_ALLOW_LIST` for a focused ticker set, `--force` to bypass market hours, `--max-cycles` for limited runs, dual logging (terminal + `scanner.json.log`), grader pass-through mode (`grader.enabled: false`), audit logging to SQLite (`flow_scores` + `grades`), and a **signal tracker** package (`src/tracker/`) with YAML-backed `TrackerConfig`, Pydantic models (`Signal`, snapshots, chain/flow result types), **`ChainPoller`** (UW `/api/stock/{ticker}/option-chains`), **`FlowWatcher`** (UW flow alerts, optional scanner `candidates` DB, and **`flow_ledger`** as a third evidence source), **`FlowLedger`** (append-only flow rows for watched tickers), **`NewsWatcher`** (UW `/api/news/headlines` plus SEC EDGAR EFTS on a **4-hour cadence** per signal—see [News watcher](#news-watcher)), SQLite **`news_events`** for deduped catalyst rows, deterministic **`ConvictionEngine`** (optional **`LedgerAggregate`** and optional **`NewsWatchResult`** for headline/filing bonuses), **`run_signal_intake`** / **`run_monitor`** wired from **`scanner.run_pipeline`** when **`tracker.enabled`**, **one monitored signal per ticker** at intake (pilot: extra strikes enrich the existing signal via the ledger, not a second row), and `SignalStore` on **`signals`** / **`signal_snapshots`** / **`flow_ledger`** in `data/trades.db` (see [Signal Tracker](#signal-tracker)).
+**Key features:** Confluence enrichment (dark pool + market tide), **Gate 0** universe filter (static lists + cached UW stock info), deterministic **Gates 1 → 1.5 → 2** before most LLM spend (Gate 1.5 adds a small UW footprint but avoids expensive Gates 2–3 on “explained” flow), Gate 3 uses three specialist calls plus one synthesis call (not the legacy single-shot context grader in production), optional `GATE0_ALLOW_LIST` for a focused ticker set, `--force` to bypass market hours, `--max-cycles` for limited runs, dual logging (terminal + rotating `scanner.json.log`), grader pass-through mode (`grader.enabled: false`), audit logging to SQLite (`flow_scores` + `grades`), and a **signal tracker** package (`src/tracker/`) with YAML-backed `TrackerConfig`, Pydantic models (`Signal`, snapshots, chain/flow result types), **`ChainPoller`**, **`FlowWatcher`**, **`FlowLedger`**, **`NewsWatcher`**, **`news_events`**, **`ConvictionEngine`**, **`run_signal_intake`** / **`run_monitor`** from **`scanner.run_pipeline`** when **`tracker.enabled`**, **one monitored signal per ticker** at intake, and `SignalStore` on **`signals`** / **`signal_snapshots`** / **`flow_ledger`** in `data/trades.db` (see [Signal Tracker](#signal-tracker)).
+
+**Hardening (in-repo):** **`portfolio:`** limits and **`tracker/guardrails.check_guardrails`** run in the monitor before anything is pushed to the **`executor_queue`**; backtest tooling (**`scripts/backfill.py`**, **`scripts/replay.py`**, **`scripts/measure_outcomes.py`**, **`scripts/param_sweep.py`**); operational resilience (SIGINT/SIGTERM graceful shutdown, DB cleanup task, monitor API circuit breaker, **`data/heartbeat.txt`** + **`data/monitor_heartbeat.txt`**, **`scripts/health_check.py`**, Docker **`pipeline`** service and **`docker/agentic-trader.service`**). Details: [Hardening & reliability](#hardening--reliability).
 
 ### Quick run (full pipeline)
 
@@ -63,6 +65,8 @@ See [Getting Started](#getting-started) for venv setup, `.env`, and all run mode
 - [Observability](#observability)
 - [Testing](#testing)
 - [Deployment](#deployment)
+- [Hardening & reliability](#hardening--reliability)
+- [Live pilot: real capital (end-to-end)](#live-pilot-real-capital-end-to-end)
 - [License](#license)
 
 ---
@@ -957,7 +961,7 @@ The **signal tracker** is a peer package under `src/tracker/` for **stateful mon
 | Typed config | `tracker.config` | `TrackerConfig`, `LedgerConfig`, **`NewsWatcherConfig`**, `ConvictionScoringConfig`, `load_tracker_config(dict)` |
 | Domain models | `tracker.models` | `Signal`, `SignalSnapshot`, **`LedgerEntry`**, **`LedgerAggregate`**, **`NewsEvent`**, **`NewsWatchResult`**, enums/constants, plus chain/flow DTOs |
 | Intake | `tracker.intake.run_signal_intake` | Async consumer of **`scored_queue`**; creates **`Signal`** rows (`PENDING`), honors **`max_active_signals`**, **skips if ticker already monitored** (`pending` / `accumulating` / `actionable`), then duplicate **contract** check |
-| Monitor | `tracker.monitor.run_monitor` | Interval from **`MarketClock`** + `poll_interval_*`; per active signal: poll chain, watch flow (including ledger), **`NewsWatcher.check()`**, **`ledger.aggregate`** → **`ConvictionEngine.evaluate(...)`** → optional **`Regrader.maybe_regrade()`** (blend), snapshot cap, DB update (including **`regrade_count`** / **`milestones_fired`**), **`executor_queue`** on first **`ACTIONABLE`** |
+| Monitor | `tracker.monitor.run_monitor` | Interval from **`MarketClock`** + `poll_interval_*`; per active signal: poll chain, watch flow (including ledger), **`NewsWatcher.check()`**, **`ledger.aggregate`** → **`ConvictionEngine.evaluate(...)`** → optional **`Regrader.maybe_regrade()`** (blend), snapshot cap, DB update (including **`regrade_count`** / **`milestones_fired`**); on **`ACTIONABLE`**, **`check_guardrails`** (YAML **`portfolio:`**) before **`executor_queue.put`** (re-checked while temporarily blocked) |
 | Chain poller | `tracker.chain_poller.ChainPoller` | One UW call per poll to `/api/stock/{ticker}/option-chains`; `uw_get_json(..., use_cache=False)` |
 | Flow ledger | `tracker.flow_ledger.FlowLedger` | `record` / `record_batch` (`INSERT OR IGNORE` on **`alert_id`**), `aggregate`, `purge_terminal`, retention purge |
 | Flow watcher | `tracker.flow_watcher.FlowWatcher` | UW flow alerts + optional scanner **`candidates`** DB + **`_fetch_ledger_entries`** when ledger is wired (`output.sqlite_db_path` resolved in **`run_pipeline`**) |
@@ -965,9 +969,9 @@ The **signal tracker** is a peer package under `src/tracker/` for **stateful mon
 | Re-grader | `tracker.regrader.Regrader` | Milestone checks, **`EnrichedLLMClient`**, agents + re-grade synthesis, blend, **`regrades`** persistence |
 | Scanner | `scanner.main` | When tracker+ledger enabled: splits flow alerts into **discovery** (dedup → engine → grade path) vs **watched** (writes **`flow_ledger`**; supplemental per-ticker UW fetch for sub-threshold flow) |
 | Conviction engine | `tracker.conviction.ConvictionEngine` | Pure scoring + state recommendation; optional **`ledger_aggregate`** and optional **`news`** (`+4` if **`has_catalyst`**, `+5` if SEC filing in-cycle) |
-| Pipeline wiring | `scanner.run_pipeline.main` | `async with httpx.AsyncClient` → `asyncio.gather(run_scanner, run_grader, [intake, monitor])`; passes **`max_cycles`** into **`run_monitor`** for bounded test runs |
+| Pipeline wiring | `scanner.run_pipeline.main` | `async with httpx.AsyncClient` → `asyncio.gather(run_scanner, run_grader, [intake, monitor])`; passes **`max_cycles`**, **`operations`**, **`shutdown_event`**, **`portfolio_config`** into **`run_monitor`** for bounded test runs |
 | Grader sentinel | `grader.main.run_grader` | After the candidate **`None`** sentinel, **`await scored_queue.put(None)`** so intake exits |
-| Persistence | `tracker.signal_store.SignalStore` | Async SQLite CRUD for **`signals`** / **`signal_snapshots`**; **`get_watched_tickers`**, **`get_ticker_signal_map`**, **`has_active_signal_for_ticker`** for scanner/intake |
+| Persistence | `tracker.signal_store.SignalStore` | Async SQLite CRUD for **`signals`** / **`signal_snapshots`**; **`get_watched_tickers`**, **`get_ticker_signal_map`**, **`has_active_signal_for_ticker`**, **`get_signals_by_state`** for scanner/intake / guardrails |
 | Schema | `shared.db._ensure_tables` | `signals` (+ **`regrade_count`**, **`last_regraded_at`**, **`milestones_fired`**), `signal_snapshots`, **`flow_ledger`**, **`news_events`**, **`regrades`** (+ migrations for existing DBs) |
 
 Load the tracker section after parsing YAML: `load_tracker_config(load_config(...))`.
@@ -1065,7 +1069,7 @@ Logs are emitted as structured JSON to **both** the terminal (stdout) and `scann
 
 Key metrics: alerts per cycle (connectivity), dedup hit rate (trade freshness), candidates per hour (rule tightness), `dark_pool_confirmed` / `market_tide_aligned` (confluence quality), and cycle duration (polling drift). Grader-side look for `gate1_5.result` and `pipeline.gate1_5_reject` when tuning explainability pass rates.
 
-A heartbeat file at `data/heartbeat.txt` is updated every cycle with `datetime.utcnow().isoformat()`. Use it with cron or a process monitor to restart if the file goes stale (e.g. no update in 5 minutes).
+A heartbeat file at `data/heartbeat.txt` is updated every scanner cycle with `datetime.utcnow().isoformat()`. The signal monitor writes `data/monitor_heartbeat.txt` each cycle (cycle number, active signal count, consecutive API-failure streak). Use **`scripts/health_check.py`** or cron to detect stale heartbeats (e.g. no update in 5–10 minutes).
 
 ---
 
@@ -1111,7 +1115,7 @@ python -m pytest tests/test_tracker_models.py tests/test_signal_store.py tests/t
 
 Install the project editable plus test (or dev) extras so `respx` and `pytest-asyncio` are present: `pip install -e ".[test,grader]"` (minimal for CI) or `pip install -e ".[dev,grader]"` (includes ruff/mypy). Pytest is configured with `pythonpath = ["src", "."]` in `pyproject.toml` so `grader`, `scanner`, `shared`, and `tracker` import from `src/` without setting `PYTHONPATH` manually.
 
-Notable suites: `tests/test_gate0.py`, `tests/test_gate1_5.py`, `tests/test_sector_cache.py`, `tests/test_vol_analyst.py`, `tests/test_risk_analyst.py`, `tests/test_sector_analyst.py`, `tests/test_sentiment_analyst.py`, `tests/test_insider_tracker.py`, `tests/test_flow_analyst.py`, `tests/test_tracker_models.py`, `tests/test_signal_store.py`, `tests/test_chain_poller.py`, `tests/test_flow_watcher.py`, `tests/test_flow_ledger.py`, `tests/test_conviction.py`, `tests/test_news_watcher.py`, `tests/test_regrader.py`.
+Notable suites: `tests/test_gate0.py`, `tests/test_gate1_5.py`, `tests/test_sector_cache.py`, `tests/test_vol_analyst.py`, `tests/test_risk_analyst.py`, `tests/test_sector_analyst.py`, `tests/test_sentiment_analyst.py`, `tests/test_insider_tracker.py`, `tests/test_flow_analyst.py`, `tests/test_tracker_models.py`, `tests/test_signal_store.py`, `tests/test_chain_poller.py`, `tests/test_flow_watcher.py`, `tests/test_flow_ledger.py`, `tests/test_conviction.py`, `tests/test_news_watcher.py`, `tests/test_regrader.py`, `tests/test_guardrails.py`, `tests/test_portfolio_config.py`, `tests/test_graceful_shutdown.py`, `tests/test_cleanup.py`, `tests/test_health_check.py`, `tests/test_log_rotation.py`.
 
 If your default `python` is not 3.11+, run tests with `python3.11 -m pytest ...` (project requires Python 3.11+).
 
@@ -1148,19 +1152,135 @@ python scripts/replay.py tests/fixtures/flow_alerts_sample.json
 docker compose -f docker/docker-compose.yaml up --build
 ```
 
-The compose file mounts `data/` for SQLite persistence and `config/` for live config changes without rebuilds.
-
-The bundled **`docker/Dockerfile`** default **`CMD`** runs **`python -m scanner.main`** (scanner loop **only** — no grader consumer). To run the **full pipeline** (scanner + grading + synthesis) in a container, override the command, for example:
-
-```bash
-docker compose -f docker/docker-compose.yaml run --rm scanner python -m scanner.run_pipeline
-```
+The compose service is **`pipeline`**: it builds from **`docker/Dockerfile`**, mounts `data/` and `config/`, sets **`restart: unless-stopped`**, resource limits (1G RAM / 1 CPU), log rotation (`max-size` / `max-file`), and runs **`python -m scanner.run_pipeline --force`** by default. The image **HEALTHCHECK** treats **`data/heartbeat.txt`** (scanner) as fresh if touched within the last 10 minutes.
 
 Ensure `UW_API_TOKEN`, `ANTHROPIC_API_KEY`, and (for Gate 3 specialists) `FINNHUB_API_KEY` are set in `.env` or the compose environment.
+
+### systemd (non-Docker)
+
+Example unit file: **`docker/agentic-trader.service`** (full pipeline, `PYTHONPATH` to `src/`, journal logging).
+
+```bash
+sudo cp docker/agentic-trader.service /etc/systemd/system/
+sudo useradd --system --shell /usr/sbin/nologin trader
+sudo chown -R trader:trader /opt/agentic-trader/data
+sudo systemctl daemon-reload
+sudo systemctl enable agentic-trader
+sudo systemctl start agentic-trader
+sudo systemctl status agentic-trader
+sudo journalctl -u agentic-trader -f
+```
+
+Adjust **`WorkingDirectory`**, **`ExecStart`**, **`User`**, and **`ReadWritePaths`** to match your install path.
+
+### Heartbeat watchdog
+
+`data/heartbeat.txt` is updated each scanner cycle; **`data/monitor_heartbeat.txt`** is updated each monitor cycle. Check both with:
+
+```bash
+.venv/bin/python scripts/health_check.py --max-age 600
+```
+
+Cron example (alert if stale):
+
+```bash
+*/5 * * * * /opt/agentic-trader/.venv/bin/python /opt/agentic-trader/scripts/health_check.py --max-age 600 || curl -s -X POST "$SLACK_WEBHOOK_URL" -H 'Content-type: application/json' -d '{"text":"Agentic Trader heartbeat stale"}'
+```
 
 ### Minimal VPS
 
 A $5/month VPS (1 CPU, 1 GB RAM) is sufficient. The scanner is I/O-bound (waiting on HTTP responses), not CPU-bound. Run behind `systemd` or `supervisord` for process management.
+
+---
+
+## Hardening & reliability
+
+This section summarizes Phase-4 style hardening that ships in the repository (not a separate product).
+
+### Backtest and threshold tuning
+
+- **`scripts/backfill.py`** — pull historical fixtures into a day-staged tree for replay.
+- **`src/replay/runner.py`** + **`scripts/replay.py`** — replay saved days through Gate 0–3 (mock LLM by default) into an isolated `replay.db`.
+- **`src/replay/measure.py`** + **`scripts/measure_outcomes.py`** — label outcomes (e.g. TP/FP) using post-hoc price moves (`yfinance` when installed).
+- **`scripts/param_sweep.py`** + **`scripts/sweep_config.yaml`** — sweep YAML parameters (e.g. `grader.score_threshold`) and write `comparison.csv` / `sweep_summary.json`.
+- Scanner **`filters.expiry.max_dte`** and flow-analyst DTE tiers are aligned for “informed positioning” windows; gate floors are overridable via **`grader.gate1_min`**, **`gate1_5_min`**, **`gate2_min`** in `config/rules.yaml`.
+
+### Operational resilience
+
+- **Graceful shutdown:** `scanner.run_pipeline` registers SIGINT/SIGTERM; **`run_scanner`**, **`run_grader`**, and **`run_monitor`** observe a shared `asyncio.Event`, and the scanner sends a **`None`** sentinel on the candidate queue for the grader.
+- **Log rotation:** `scanner.utils.logging.setup_logging` uses a **`RotatingFileHandler`**-backed writer; sizes come from **`logging:`** in `config/rules.yaml`.
+- **DB cleanup:** **`tracker.cleanup.run_cleanup`**, triggered from the monitor about once per day, prunes old ledger rows, snapshots, news, regrades, and very old terminal signals; settings under **`operations.cleanup:`**.
+- **Circuit breaker:** monitor backs off when every signal in a cycle fails; tuned via **`operations.circuit_breaker:`**.
+- **Process supervision:** **`docker/docker-compose.yaml`** service **`pipeline`**, **`docker/Dockerfile`** with healthcheck on scanner heartbeat, **`docker/agentic-trader.service`** for systemd.
+- **Heartbeats:** **`scripts/health_check.py`** checks **`data/heartbeat.txt`** and **`data/monitor_heartbeat.txt`**.
+
+### Portfolio guardrails
+
+- **`config/rules.yaml`** → **`portfolio:`** — capital caps, concentration, liquidity (spread + volume), and placeholders for limits that need broker P&L later (**`daily_loss_limit_pct`** is documented but not enforced without fills).
+- **`src/tracker/portfolio_config.py`** — typed config + **`load_portfolio_config()`** (returns **`None`** only if the **`portfolio:`** key is omitted from YAML).
+- **`src/tracker/guardrails.py`** — **`check_guardrails`**, **`compute_position_size`**, **`PositionSizing`** / **`GuardrailViolation`**.
+- **`run_monitor`** — after a signal becomes **ACTIONABLE**, guardrails run before **`executor_queue.put`**. If blocked, the signal stays ACTIONABLE, is tracked in-memory for re-checks next cycle, and is only enqueued once when cleared; terminal states clear the block set. **`scanner.output.notifier.format_actionable_signal`** formats sizing for optional Slack copy-paste.
+
+---
+
+## Live pilot: real capital (end-to-end)
+
+There is **no built-in broker integration (Agent C)** in this repo. A “real money” pilot means **you** are the execution layer: the pipeline finds and tracks ideas; you place and manage orders at your broker after explicit checks. Treat the following as a checklist, not financial advice.
+
+### 1. Preconditions
+
+1. **Accounts:** Options-enabled brokerage account; Unusual Whales + Anthropic (+ Finnhub for Gate 3) API keys in **`.env`** (see [Getting Started](#getting-started)).
+2. **Capital:** Decide a **maximum dollar amount** you are willing to lose on this experiment and ensure **`portfolio.max_total_capital_usd`** (and derived caps) in `config/rules.yaml` reflect **only** that budget—not your entire net worth.
+3. **Workspace:** `mkdir -p data`; confirm `data/scanner.db` and `data/trades.db` paths match **`output.sqlite_db_path`** and the tracker DB (defaults under `data/`).
+4. **Read the config:** Skim **`filters:`**, **`grader:`**, **`tracker:`**, **`enrichment:`**, **`operations:`**, and **`portfolio:`** so you know what the system is allowed to do.
+
+### 2. Dry run (no orders)
+
+1. Install: `pip install -e ".[dev,grader]"` (add **`[backtest]`** if you use measurement scripts).
+2. Run a short live **read-only** session:  
+   `python -m scanner.run_pipeline --force --max-cycles 5`  
+   Watch JSON logs and `scanner.json.log` for `cycle_complete`, `pipeline.gate*`, and tracker events. No queue consumer is required; nothing places trades.
+3. Optionally run **replay** on saved backfill data and **`scripts/param_sweep.py`** to sanity-check thresholds before you risk capital.
+
+### 3. Executor queue and manual execution
+
+When **`tracker.enabled: true`**, **`run_monitor`** may push a **`Signal`** onto **`executor_queue`** only after:
+
+- Conviction and gates say **ACTIONABLE**, and  
+- **`check_guardrails`** passes (spread, volume, concurrent count, exposure proxy, per-trade loss cap).
+
+**Today there is no default consumer** for `executor_queue` inside `scanner.run_pipeline` (the queue is created in `main()` and only `run_monitor` writes to it). For a pilot you can either:
+
+- **Log-only manual mode (simplest):** Run the stock pipeline and act **only** when you see structured log event **`monitor.signal_cleared_guardrails`** (fields: `position_size_usd`, `contracts`, `max_loss_usd`, `signal_id`, `ticker`). Treat that as your “ticket” to open the broker and type the order yourself.
+- **Optional queue tap:** Copy `run_pipeline.main()` into a small private script and add another `asyncio` task in the same `gather()` that loops on `await executor_queue.get()`, logs each `Signal`, and still does **not** call a broker unless you add that code deliberately.
+
+Use **`scanner.output.notifier.format_actionable_signal(signal, position)`** if you wire Slack later.
+
+### 4. One full “live money” session (operator workflow)
+
+Assume the pipeline is already running (`run_pipeline` under systemd/Docker/tmux) during RTH or with `--force` for testing.
+
+1. **Start of day:** Confirm **`scripts/health_check.py`** returns `HEALTH: OK` (or fix connectivity before trusting signals).
+2. **Discovery → signal:** Scanner and grader create **pending** signals in SQLite; the monitor promotes them as flow and chain evidence accumulate.
+3. **Actionable + cleared guardrails:** You see **`monitor.signal_cleared_guardrails`** in logs with sizing. Open your broker; verify **ticker, strike, expiry, call/put, direction** match the **`Signal`**; verify **bid/ask spread** and **volume** are acceptable vs. your own standards (the code already enforced YAML limits, but you are the final check).
+4. **Order entry:** Place a **limit** order sized **at or below** the logged `position_size_usd` / contract count; never exceed **`portfolio.max_single_position_effective`** unless you intentionally change YAML and understand why.
+5. **Stops / risk:** Apply your own stop policy (the risk analyst suggests **`recommended_stop_loss_pct`** inside **`risk_params_json`** on the signal—use it as input, not a guarantee).
+6. **End of day:** Note fills and P&L in a spreadsheet; compare to signals that **`monitor.guardrail_blocked`** rejected (those remain ACTIONABLE in DB but were not enqueued—conditions may improve next session).
+7. **Stop the pipeline:** Send **SIGTERM** for graceful shutdown (scanner sentinel, grader completes, intake stops cleanly).
+
+### 5. What “success” looks like in a pilot
+
+- No silent auto-trading: **every** fill was intentional and sized within **`portfolio:`** and logs.
+- Guardrails occasionally block: that is **expected** when spread blows out or exposure is full.
+- You can correlate SQLite **`signals`** / **`signal_snapshots`** with broker statements.
+
+### 6. Explicit non-goals (until you build them)
+
+- **No automated broker orders** in this repository.
+- **`daily_loss_limit_pct`** is not enforced without a fill/P&L feed.
+- **Sector concentration** (`max_signals_per_sector`) is config-only for now; sector tagging on signals is a future extension.
+
+For Docker/systemd/cron watchdog commands, see [Deployment](#deployment).
 
 ---
 

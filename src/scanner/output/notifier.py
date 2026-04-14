@@ -1,10 +1,29 @@
 """Optional Slack/Discord webhook notifications for flagged candidates."""
 from __future__ import annotations
+
 import os
+from typing import TYPE_CHECKING
 
 import structlog
 
+if TYPE_CHECKING:
+    from tracker.guardrails import PositionSizing
+    from tracker.models import Signal
+
 logger = structlog.get_logger()
+
+
+def format_actionable_signal(signal: "Signal", position: "PositionSizing") -> str:
+    """Format an ACTIONABLE signal + sizing for Slack / manual execution (pilot)."""
+    return (
+        f"ACTIONABLE: {signal.ticker} {signal.direction.upper()}\n"
+        f"Strike: {signal.strike} {signal.option_type} exp {signal.expiry}\n"
+        f"Conviction: {signal.conviction_score:.0f}/100\n"
+        f"Confirming flows: {signal.confirming_flows}\n"
+        f"Position size: ${position.dollar_size:,.0f} ({position.contracts} contracts)\n"
+        f"Max loss: ${position.max_loss_usd:,.0f}\n"
+        f"Fingerprint: {signal.anomaly_fingerprint}"
+    )
 
 
 class Notifier:

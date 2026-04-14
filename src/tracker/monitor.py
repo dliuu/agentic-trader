@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import uuid
 from datetime import datetime, timezone
+from pathlib import Path
 
 import httpx
 import structlog
@@ -33,6 +34,9 @@ from tracker.news_watcher import NewsWatcher
 from tracker.regrader import Regrader
 from tracker.signal_store import SignalStore
 from grader.llm_client import LLMClient
+from tracker.guardrails import check_guardrails, compute_position_size
+from tracker.operations_config import OperationsConfig, load_operations_config
+from tracker.portfolio_config import PortfolioConfig
 
 log = structlog.get_logger()
 
@@ -49,6 +53,9 @@ async def run_monitor(
     finnhub_api_key: str = "",
     *,
     max_cycles: int | None = None,
+    operations: OperationsConfig | None = None,
+    shutdown_event: asyncio.Event | None = None,
+    portfolio_config: PortfolioConfig | None = None,
 ) -> None:
     """Main monitor loop.
 
@@ -111,6 +118,15 @@ async def run_monitor(
             pass
 
     cycle_count = 0
+    last_cleanup_at: datetime | None = None
+    CLEANUP_INTERVAL_HOURS = 24
+    consecutive_api_failures = 0
+    ops = operations or load_operations_config({})
+    heartbeat_path = Path("data/monitor_heartbeat.txt")
+    heartbeat_path.parent.mkdir(parents=True, exist_ok=True)
+    guardrail_blocked_signals: set[str] = set()
+    executor_notified: set[str] = set()
+
     log.info(
         "monitor.started",
         max_active=cfg.max_active_signals,
@@ -122,23 +138,37 @@ async def run_monitor(
     )
 
     while max_cycles is None or cycle_count < max_cycles:
+        if shutdown_event is not None and shutdown_event.is_set():
+            log.info("monitor.shutdown_graceful")
+            break
+
         cycle_count += 1
 
-        # Determine sleep interval based on market hours
         if clock and clock.is_market_hours():
             interval = cfg.poll_interval_market_seconds
         else:
             interval = cfg.poll_interval_off_hours_seconds
 
-        # Fetch all active signals
         try:
             active_signals = await store.get_active_signals()
         except Exception as exc:
             log.error("monitor.fetch_signals_failed", error=str(exc))
+            heartbeat_path.write_text(
+                f"{datetime.now(timezone.utc).isoformat()}\n"
+                f"cycle={cycle_count}\n"
+                f"active_signals=0\n"
+                f"consecutive_failures={consecutive_api_failures}\n"
+            )
             await asyncio.sleep(interval)
             continue
 
         if not active_signals:
+            heartbeat_path.write_text(
+                f"{datetime.now(timezone.utc).isoformat()}\n"
+                f"cycle={cycle_count}\n"
+                f"active_signals=0\n"
+                f"consecutive_failures={consecutive_api_failures}\n"
+            )
             await asyncio.sleep(interval)
             continue
 
@@ -148,7 +178,10 @@ async def run_monitor(
             active_signals=len(active_signals),
         )
 
+        cycle_api_errors = 0
+        cycle_signal_count = 0
         for signal in active_signals:
+            cycle_signal_count += 1
             try:
                 await _process_signal(
                     signal,
@@ -161,8 +194,12 @@ async def run_monitor(
                     executor_queue,
                     cfg,
                     ledger,
+                    portfolio_config=portfolio_config,
+                    guardrail_blocked_signals=guardrail_blocked_signals,
+                    executor_notified=executor_notified,
                 )
             except Exception as exc:
+                cycle_api_errors += 1
                 log.error(
                     "monitor.signal_error",
                     signal_id=signal.id,
@@ -172,24 +209,65 @@ async def run_monitor(
 
         log.info("monitor.cycle_complete", cycle=cycle_count)
 
+        cb = ops.circuit_breaker
+        did_backoff = False
+        if cycle_signal_count > 0 and cycle_api_errors == cycle_signal_count:
+            consecutive_api_failures += 1
+            if consecutive_api_failures >= cb.max_consecutive_failures:
+                backoff_sleep = interval * cb.backoff_multiplier
+                log.error(
+                    "monitor.circuit_breaker",
+                    consecutive_failures=consecutive_api_failures,
+                    backoff_seconds=backoff_sleep,
+                )
+                await asyncio.sleep(backoff_sleep)
+                did_backoff = True
+            else:
+                log.warning(
+                    "monitor.all_signals_failed",
+                    consecutive=consecutive_api_failures,
+                    max_before_backoff=cb.max_consecutive_failures,
+                )
+        else:
+            if consecutive_api_failures > 0:
+                log.info("monitor.circuit_breaker_reset", was=consecutive_api_failures)
+            consecutive_api_failures = 0
+
+        now = datetime.now(timezone.utc)
         if (
-            ledger is not None
-            and ecfg is not None
-            and ecfg.ledger.retention_days > 0
-            and cycle_count > 0
-            and cycle_count % 20 == 0
+            last_cleanup_at is None
+            or (now - last_cleanup_at).total_seconds() > CLEANUP_INTERVAL_HOURS * 3600
         ):
             try:
-                n = await ledger.purge_entries_older_than(ecfg.ledger.retention_days)
-                if n:
-                    log.info("monitor.ledger_retention_purge", rows=n)
+                from tracker.cleanup import CleanupConfig, run_cleanup
+
+                oc = ops.cleanup
+                cleanup_run = CleanupConfig(
+                    ledger_retention_days=cfg.ledger.retention_days,
+                    snapshot_retention_days=oc.snapshot_retention_days,
+                    news_retention_days=oc.news_retention_days,
+                    regrade_retention_days=oc.regrade_retention_days,
+                    terminal_signal_retention_days=oc.terminal_signal_retention_days,
+                    purge_terminal_signals=cfg.ledger.purge_terminal_signals,
+                    size_warning_mb=oc.size_warning_mb,
+                )
+                await run_cleanup(cleanup_run)
+                last_cleanup_at = now
             except Exception as exc:
-                log.warning("monitor.ledger_retention_failed", error=str(exc))
+                log.warning("monitor.cleanup_failed", error=str(exc))
+
+        heartbeat_path.write_text(
+            f"{datetime.now(timezone.utc).isoformat()}\n"
+            f"cycle={cycle_count}\n"
+            f"active_signals={len(active_signals)}\n"
+            f"consecutive_failures={consecutive_api_failures}\n"
+        )
 
         if max_cycles is not None and cycle_count >= max_cycles:
             break
 
-        await asyncio.sleep(interval)
+        if not did_backoff:
+            await asyncio.sleep(interval)
 
     log.info("monitor.stopped")
 
@@ -205,6 +283,10 @@ async def _process_signal(
     executor_queue: asyncio.Queue[Signal],
     cfg: TrackerConfig,
     ledger: FlowLedger | None,
+    *,
+    portfolio_config: PortfolioConfig | None = None,
+    guardrail_blocked_signals: set[str] | None = None,
+    executor_notified: set[str] | None = None,
 ) -> None:
     """Run one poll cycle for a single signal."""
     now = datetime.now(timezone.utc)
@@ -432,6 +514,12 @@ async def _process_signal(
 
     await store.update_signal(signal.id, **update_fields)
 
+    if new_state in TERMINAL_STATES:
+        if guardrail_blocked_signals is not None:
+            guardrail_blocked_signals.discard(signal.id)
+        if executor_notified is not None:
+            executor_notified.discard(signal.id)
+
     if ledger is not None and new_state in (
         SignalState.EXPIRED,
         SignalState.DECAYED,
@@ -445,9 +533,53 @@ async def _process_signal(
         except Exception as exc:
             log.warning("monitor.ledger_purge_failed", signal_id=signal.id, error=str(exc))
 
-    # 8. Push actionable signals to executor
-    if new_state == SignalState.ACTIONABLE and signal.state != SignalState.ACTIONABLE:
-        # Re-fetch the signal with updated fields for Agent C
+    # 8. Portfolio guardrails + push actionable signals to executor
+    is_newly_actionable = (
+        new_state == SignalState.ACTIONABLE and signal.state != SignalState.ACTIONABLE
+    )
+    was_blocked = (
+        guardrail_blocked_signals is not None and signal.id in guardrail_blocked_signals
+    )
+
+    if (
+        portfolio_config is not None
+        and guardrail_blocked_signals is not None
+        and executor_notified is not None
+    ):
+        if is_newly_actionable or (new_state == SignalState.ACTIONABLE and was_blocked):
+            updated_signal = await store.get_signal(signal.id)
+            if updated_signal:
+                violation = await check_guardrails(
+                    updated_signal, chain, portfolio_config, store
+                )
+                if violation:
+                    guardrail_blocked_signals.add(signal.id)
+                    log.warning(
+                        "monitor.guardrail_blocked",
+                        signal_id=signal.id,
+                        ticker=signal.ticker,
+                        rule=violation.rule,
+                        limit=violation.limit,
+                        actual=violation.actual,
+                        message=violation.message,
+                    )
+                else:
+                    guardrail_blocked_signals.discard(signal.id)
+                    if executor_notified is not None and signal.id not in executor_notified:
+                        position = compute_position_size(
+                            updated_signal, chain, portfolio_config
+                        )
+                        log.info(
+                            "monitor.signal_cleared_guardrails",
+                            signal_id=signal.id,
+                            ticker=signal.ticker,
+                            position_size_usd=round(position.dollar_size, 2),
+                            contracts=position.contracts,
+                            max_loss_usd=round(position.max_loss_usd, 2),
+                        )
+                        await executor_queue.put(updated_signal)
+                        executor_notified.add(signal.id)
+    elif is_newly_actionable:
         updated_signal = await store.get_signal(signal.id)
         if updated_signal:
             await executor_queue.put(updated_signal)

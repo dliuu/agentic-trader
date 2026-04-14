@@ -121,6 +121,20 @@ class SignalStore:
         finally:
             await db.close()
 
+    async def get_signals_by_state(self, state: SignalState) -> list[Signal]:
+        """Return all signals in the given lifecycle state."""
+        db = await self._connect()
+        try:
+            cursor = await db.execute(
+                "SELECT * FROM signals WHERE state = ? ORDER BY created_at ASC",
+                (state.value,),
+            )
+            rows = await cursor.fetchall()
+            columns = [d[0] for d in cursor.description]
+            return [self._row_to_signal(dict(zip(columns, row))) for row in rows]
+        finally:
+            await db.close()
+
     async def get_signal(self, signal_id: str) -> Signal | None:
         """Fetch a single signal by ID."""
         db = await self._connect()
